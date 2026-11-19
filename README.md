@@ -50,11 +50,9 @@ Click the version number next to the logo to check at any time.
 
 ## Publishing a new version
 
-1. Change `VERSION = "x.y.z"` near the top of `iptv_library.py` and commit.
-2. Tag and push: `git tag vx.y.z && git push origin vx.y.z` (or create a release on GitHub with that tag).
-
-The **Release** workflow checks the version and attaches `iptv_library.py` and `docker-compose.yml` to the release.
-Every install's Update button then picks it up.
+Change `VERSION = "x.y.z"` near the top of `iptv_library.py` and push to `main`.
+The **Release** workflow checks the app, creates release `vx.y.z` with `iptv_library.py` and `docker-compose.yml` attached,
+and every install's Update button picks it up. Pushes that don't change the version don't create a release.
 
 ## Without Docker
 

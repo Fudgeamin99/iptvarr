@@ -1,12 +1,13 @@
 name: Release
 
-# Bump VERSION in iptv_library.py, then push a tag like v1.2.0 (or create a release on github.com).
-# This attaches the files that docker-compose.yml and the app's Update button download.
+# Publishing an update = change VERSION in iptv_library.py and push to main.
+# If there's no release for that version yet, this creates one (tag vX.Y.Z) with the files
+# that docker-compose.yml and the app's Update button download.
 on:
   push:
-    tags: ["v*"]
-  release:
-    types: [published]
+    branches: [main]
+    paths: ["iptv_library.py", "docker-compose.yml"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -17,15 +18,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check the app is valid and VERSION matches the tag
+      - name: Check the app and read its version
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           python3 -m py_compile iptv_library.py
           V=$(python3 -c "import re;print(re.search(r'^VERSION = \"(.+?)\"', open('iptv_library.py').read(), re.M).group(1))")
-          if [ "v$V" != "$GITHUB_REF_NAME" ]; then echo "::error::VERSION in iptv_library.py is $V but the tag is $GITHUB_REF_NAME"; exit 1; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          if gh release view "v$V" >/dev/null 2>&1; then
+            echo "Release v$V already exists - nothing to publish (bump VERSION to release)."
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Publish release files
+      - name: Publish release v${{ steps.ver.outputs.version }}
+        if: steps.ver.outputs.new == 'true'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: v${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
           files: |
             iptv_library.py
