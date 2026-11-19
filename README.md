@@ -7,12 +7,13 @@ It runs in Docker on UGREEN, Synology, Unraid or any other Docker host, and you 
 
 - **Works with most providers:** Xtream Codes login (server + username + password) or an M3U playlist URL
 - **Movies & TV Shows** with posters, categories, search, sort, plots, cast and ratings
-- **Play** in the browser, or open any title in VLC
+- **Play** in the browser, choosing the **audio language and subtitles** while you watch, or open any title in VLC
+- **Live TV for Plex & Jellyfin:** tick the channels you want and they appear in Plex or Jellyfin with a full **TV guide (EPG)**
 - **Download** movies, single episodes, whole seasons or entire shows straight to your NAS, saved as
   `Title (Year).mkv` and `Show/Season 01/Show S01E01 - Title.mp4`
   - choose **separate folders for Movies and TV Shows** with a built-in folder browser
-- **Audio & subtitles:** see every audio track and subtitle in a title and pick the ones you want (English by default).
-  Downloads keep just your choice (no re-encoding, so there's no quality loss), with an optional `.srt` file that Plex and Jellyfin pick up. VLC opens with the same choice.
+- **Audio & subtitles:** when a movie or episode has more than one language or audio type, Download asks which to keep (English is pre-selected).
+  The download keeps just your choice (no re-encoding, so there's no quality loss), with an optional `.srt` file that Plex and Jellyfin pick up.
   - progress, speed and time left, and downloads resume after a dropped connection or a restart
 - **Export** any list as an `.m3u` playlist or a `.csv` spreadsheet
 - **One-click updates** from this repo's releases
@@ -108,14 +109,37 @@ Keep **"At the same time"** in the Downloads panel at 1 unless your IPTV plan al
 
 ## Audio & subtitles
 
-Click **🎧 Audio & subtitles** on any movie or episode to see what's inside the file, e.g. *English · AC3 5.1*,
-*Spanish · AAC Stereo*, *English (forced)*, and pick what you want. Seasons and whole shows use your default languages,
-which you set under **⬇ Downloads → Audio & subtitles**: audio language, subtitle language (or Off), whether to keep the
-other audio languages, and whether to also save an `.srt`.
+**Downloading:** if a movie or episode has more than one audio track or any subtitles, **⬇ Download** shows what's inside the file,
+e.g. *English · AC3 5.1*, *Spanish · AAC Stereo*, *English (forced)*, and asks what to keep. For a season or a whole show, you choose
+once from the first episode and the choice is applied to every episode by language. Titles with nothing to choose download straight away.
+The languages that are pre-selected (English) are set under **⬇ Downloads → Audio & subtitles**, along with whether to keep the
+other audio languages and whether to also save an `.srt`.
 
-What you can pick depends on your provider: many IPTV files only have one audio track and no subtitles.
-Downloads are remuxed with FFmpeg (copied, not re-encoded). If anything goes wrong, the original file is kept.
-Picture-based subtitles (PGS/DVD) can be kept inside `.mkv` files but can't be turned into `.srt`.
+**Watching in the browser:** the player has audio and subtitle menus. FFmpeg on your NAS copies the picture, converts the chosen
+audio to AAC stereo and streams it, so `.mkv` files and AC3/DTS audio that browsers can't normally play work too. HEVC (H.265)
+video only plays in browsers that support it; use **Open in VLC** otherwise.
+
+What you can pick depends on your provider: many IPTV files only have one audio track and no subtitles. Downloads are copied with
+FFmpeg (not re-encoded), and if anything goes wrong the original file is kept. Picture-based subtitles (PGS/DVD) can be kept inside
+`.mkv` downloads but can't be shown in the browser or turned into `.srt`.
+
+## Live TV in Plex & Jellyfin
+
+Open the **Live TV** tab, tick the channels you want (or **Tick all shown** for a whole category), and press **Save channels**.
+Then click **📺 Plex & Jellyfin setup** for the addresses to paste:
+
+| | Plex (needs Plex Pass) | Jellyfin |
+|---|---|---|
+| Tuner | Live TV & DVR → Set up → enter `NAS-IP:8765` manually | Live TV → Tuner Devices → **M3U Tuner** → `http://NAS-IP:8765/live/channels.m3u` |
+| Guide | "Have an XMLTV guide…?" → `http://NAS-IP:8765/live/epg.xml` | TV Guide Data Providers → **XMLTV** → `http://NAS-IP:8765/live/epg.xml` |
+
+- The app acts as an HDHomeRun network tuner for Plex and serves an M3U playlist for Jellyfin. Both only contain your ticked channels.
+- The **guide (EPG)** comes from your provider. It's filtered to your channels and renumbered to match, so they line up automatically,
+  and it refreshes every 12 hours. You can also point it at a different XMLTV source.
+- Channel numbers stay the same when you add or remove channels, so the guide matching in Plex/Jellyfin doesn't break.
+- **Channels watched at once** limits how many streams run together. Keep it within your IPTV plan's connection limit.
+- These addresses work without the app password (Plex and Jellyfin can't enter one). Your IPTV login is saved on the NAS
+  (`config/livetv.json`) so they can tune channels.
 
 ## Updating
 

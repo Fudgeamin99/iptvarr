@@ -17,6 +17,7 @@ Everything runs locally; your login is only ever sent to your own IPTV server.
 """
 import argparse
 import base64
+import gzip
 import hmac
 import json
 import os
@@ -26,16 +27,19 @@ import shutil
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 REPO = os.environ.get("IPTV_REPO", "Fudgeamin99/iptvarr")   # GitHub repo the Update button checks
 UA = "Mozilla/5.0 (IPTV Library) VLC/3.0.20"
 # Many IPTV panels use self-signed / expired certificates.
@@ -72,11 +76,15 @@ VIDEO_EXT = re.compile(r"\.(mp4|mkv|avi|mov|m4v|wmv|flv|webm)$", re.I)
 
 
 def parse_m3u(text):
-    movies, shows = [], {}
+    movies, shows, live, epg_url = [], {}, [], ""
     cur = None
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
+            continue
+        if line.startswith("#EXTM3U"):
+            h = dict(ATTR.findall(line))
+            epg_url = (h.get("url-tvg") or h.get("x-tvg-url") or "").split(",")[0].strip()
             continue
         if line.startswith("#EXTINF"):
             attrs = dict(ATTR.findall(line))
@@ -84,7 +92,8 @@ def parse_m3u(text):
             name = rest.split(",", 1)[1].strip() if "," in rest else attrs.get("tvg-name", "")
             cur = {"name": name or attrs.get("tvg-name", "Untitled"),
                    "logo": attrs.get("tvg-logo", ""),
-                   "group": attrs.get("group-title", "") or "Uncategorised"}
+                   "group": attrs.get("group-title", "") or "Uncategorised",
+                   "epg": attrs.get("tvg-id", ""), "chno": attrs.get("tvg-chno", "")}
             continue
         if line.startswith("#") or cur is None:
             continue
@@ -102,14 +111,15 @@ def parse_m3u(text):
                 {"num": ep, "title": item["name"], "url": url})
         elif "/movie/" in path or VIDEO_EXT.search(path):
             movies.append({**item, "url": url})
-        # anything else is a live channel - skipped
+        else:                                           # anything else is a live TV channel
+            live.append({**item, "url": url})
     series = list(shows.values())
     for s in series:
         for eps in s["seasons"].values():
             eps.sort(key=lambda e: e["num"])
             for i, e in enumerate(eps, 1):
                 e["num"] = e["num"] or i
-    return {"movies": movies, "series": series}
+    return {"movies": movies, "series": series, "live": live, "epg_url": epg_url}
 
 
 # ---------------------------------------------------------------- Downloads
@@ -227,7 +237,7 @@ def probe_tracks(src, remote=True):
         raise RuntimeError("FFmpeg isn't installed, so tracks can't be read")
     if remote and src in TRACK_CACHE:
         return TRACK_CACHE[src]
-    cmd = [FFPROBE, "-v", "error", "-print_format", "json", "-show_streams"]
+    cmd = [FFPROBE, "-v", "error", "-print_format", "json", "-show_streams", "-show_format"]
     if remote:
         if not src.startswith(("http://", "https://")):
             raise ValueError("Only http(s) links can be checked")
@@ -235,8 +245,11 @@ def probe_tracks(src, remote=True):
     r = subprocess.run(cmd + [src], capture_output=True, timeout=90)
     if r.returncode:
         raise RuntimeError("Couldn't read the file's tracks: " + (r.stderr.decode("utf-8", "replace").strip().splitlines() or ["unknown error"])[-1][:200])
-    audio, subs = [], []
-    for st in json.loads(r.stdout or b"{}").get("streams", []):
+    audio, subs, video = [], [], ""
+    info = json.loads(r.stdout or b"{}")
+    for st in info.get("streams", []):
+        if st.get("codec_type") == "video" and not video and not (st.get("disposition") or {}).get("attached_pic"):
+            video = st.get("codec_name", "")
         tags = {k.lower(): v for k, v in (st.get("tags") or {}).items()}
         disp = st.get("disposition") or {}
         lang = lang_code(tags.get("language"))
@@ -247,7 +260,11 @@ def probe_tracks(src, remote=True):
             audio.append({**t, "n": len(audio), "channels": st.get("channels") or 0})
         elif st.get("codec_type") == "subtitle":
             subs.append({**t, "n": len(subs), "text": t["codec"] in TEXT_SUBS})
-    res = {"audio": audio, "subs": subs}
+    try:
+        duration = float((info.get("format") or {}).get("duration") or 0)
+    except ValueError:
+        duration = 0
+    res = {"audio": audio, "subs": subs, "duration": duration, "video": video}
     if remote:
         TRACK_CACHE[src] = res
     return res
@@ -277,6 +294,59 @@ def pick_sub(subs, want, lang):
         return None
     same = [x for x in subs if x["lang"] == lang]
     return sorted(same, key=lambda x: (x["forced"], not x["text"]))[0] if same else None
+
+
+# ---- watching in the browser with a chosen audio track / subtitles
+# FFmpeg copies the picture, turns the chosen audio into AAC stereo (plays everywhere) and streams it as MP4.
+# The chosen subtitles are written to a WebVTT file as the file is read, and the page picks up new lines.
+PLAY = {}
+
+
+def play_start(body):
+    if not (FFMPEG and FFPROBE):
+        raise RuntimeError("FFmpeg isn't installed")
+    url = str(body.get("url", ""))
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("Only http(s) links can be played")
+    old = body.get("previous")
+    if old in PLAY:
+        play_stop(old)
+    for k, v in list(PLAY.items()):                     # tidy sessions nobody stopped
+        if time.time() - v["t"] > 8 * 3600:
+            play_stop(k)
+    sid = os.urandom(8).hex()
+    aud, sub = body.get("audio"), body.get("subs")
+    PLAY[sid] = {"url": url, "audio": aud if isinstance(aud, int) else None, "subs": sub if isinstance(sub, int) else None,
+                 "start": max(0.0, float(body.get("start") or 0)), "proc": None, "t": time.time(), "err": "",
+                 "vtt": Path(tempfile.gettempdir()) / f"iptvlib-{sid}.vtt"}
+    return {"sid": sid}
+
+
+def play_stop(sid):
+    sess = PLAY.pop(sid, None)
+    if not sess:
+        return
+    proc = sess.get("proc")
+    if proc and proc.poll() is None:
+        proc.kill()
+    try:
+        sess["vtt"].unlink()
+    except OSError:
+        pass
+
+
+def play_command(sess):
+    cmd = [FFMPEG, "-v", "error", "-nostdin"]
+    if sess["start"] > 0:
+        cmd += ["-ss", f"{sess['start']:.2f}"]
+    cmd += ["-user_agent", UA, "-protocol_whitelist", "http,https,tcp,tls,crypto",
+            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5", "-i", sess["url"],
+            "-map", "0:v:0", "-map", f"0:{sess['audio']}" if sess["audio"] is not None else "0:a:0?",
+            "-c:v", "copy", "-c:a", "aac", "-ac", "2", "-b:a", "192k", "-sn", "-dn",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"]
+    if sess["subs"] is not None:
+        cmd += ["-map", f"0:{sess['subs']}", "-c:s", "webvtt", "-flush_packets", "1", "-f", "webvtt", str(sess["vtt"])]
+    return cmd
 
 
 DEFAULT_PREFS = {"audio_lang": "eng", "sub_lang": "eng", "keep_audio": False, "srt": True}
@@ -360,7 +430,7 @@ class Downloader:
 
     # the queue is saved so restarts and updates don't lose downloads (they resume from .part files)
     def persist(self):
-        keep = ("title", "url", "dest", "status", "done", "total", "error", "audio", "subs")
+        keep = ("title", "url", "dest", "status", "done", "total", "error", "audio", "subs", "alang", "slang")
         with self.lock:
             rows = [{k: j.get(k) for k in keep} for j in sorted(self.jobs.values(), key=lambda j: j["id"])
                     if j["status"] in ACTIVE + ("failed", "cancelled")]
@@ -407,7 +477,9 @@ class Downloader:
                                        "dest": dest, "status": "queued", "done": 0, "total": 0,
                                        "speed": 0, "error": "", "cancel": False, "note": "",
                                        "audio": aud if isinstance(aud, int) else None,
-                                       "subs": sub if isinstance(sub, int) or sub == "none" else None}
+                                       "subs": sub if isinstance(sub, int) or sub == "none" else None,
+                                       "alang": lang_code(it.get("alang")) if it.get("alang") else None,
+                                       "slang": ("off" if it.get("slang") == "off" else lang_code(it["slang"])) if it.get("slang") else None}
                 busy.add(dest)
                 self.q.put(self.seq)
                 added += 1
@@ -539,8 +611,8 @@ class Downloader:
         if len(audio) <= 1 and not subs:
             return                                     # nothing to choose between
         P = self.prefs
-        a = pick_audio(audio, j.get("audio"), P["audio_lang"])
-        sub = pick_sub(subs, j.get("subs"), P["sub_lang"])
+        a = pick_audio(audio, j.get("audio"), j.get("alang") or P["audio_lang"])
+        sub = pick_sub(subs, j.get("subs"), j.get("slang") or P["sub_lang"])
         order = ([a] + ([x for x in audio if x is not a] if P["keep_audio"] else [])) if a else []
         embed = bool(sub) and (fmt == "matroska" or sub["text"])
         j["status"] = "processing"
@@ -639,6 +711,192 @@ def restart_self():
     os.execv(sys.executable, args)
 
 
+# ---------------------------------------------------------------- Live TV for Plex & Jellyfin
+# The app pretends to be an HDHomeRun network tuner (what Plex looks for) and also serves an M3U
+# playlist (what Jellyfin uses), both containing only the channels you ticked, plus a matching guide.
+LIVE_FILE = Path(CONFIG_DIR) / "livetv.json" if CONFIG_DIR else Path.home() / ".iptv_library_livetv.json"
+EPG_FILE = Path(CONFIG_DIR) / "epg.xml" if CONFIG_DIR else Path.home() / ".iptv_library_epg.xml"
+TUNER_PATHS = ("/discover.json", "/lineup.json", "/lineup_status.json", "/device.xml")
+EPG_STATE = {"state": "idle", "updated": 0, "error": "", "programmes": 0, "matched": 0}
+STREAMS = {"n": 0, "lock": threading.Lock()}
+
+
+def load_live():
+    try:
+        d = json.loads(LIVE_FILE.read_text())
+    except Exception:
+        d = {}
+    d.setdefault("source", None)
+    d.setdefault("channels", [])
+    d.setdefault("tuners", 2)
+    d.setdefault("epg_url", "")
+    d.setdefault("device_id", os.urandom(4).hex().upper())
+    if os.path.exists(EPG_FILE):
+        EPG_STATE.update(state="ready", updated=os.path.getmtime(EPG_FILE), programmes=d.get("epg_programmes", 0),
+                         matched=d.get("epg_matched", 0))
+    return d
+
+
+LIVE = load_live()
+
+
+def save_live():
+    tmp = LIVE_FILE.with_name(LIVE_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(LIVE, indent=1))
+    try:
+        os.chmod(tmp, 0o600)                            # it holds your IPTV login
+    except OSError:
+        pass
+    os.replace(tmp, LIVE_FILE)
+
+
+def live_stream_url(ch):
+    src = LIVE.get("source") or {}
+    if ch.get("url"):
+        return ch["url"]
+    q = urllib.parse.quote
+    return f"{src.get('server')}/live/{q(src.get('user', ''))}/{q(src.get('pass', ''))}/{ch['id']}.ts"
+
+
+def live_guide_source():
+    if LIVE.get("epg_url"):
+        return LIVE["epg_url"]
+    src = LIVE.get("source") or {}
+    if src.get("type") == "xtream":
+        return f"{src['server']}/xmltv.php?" + urllib.parse.urlencode({"username": src["user"], "password": src["pass"]})
+    return src.get("epg_url", "")
+
+
+def live_save(source, channels, tuners=None):
+    if not isinstance(source, dict):
+        raise ValueError("Missing IPTV account")
+    if source.get("type") == "xtream":
+        src = {"type": "xtream", "server": normalize_server(source.get("server")), "user": str(source.get("user") or ""),
+               "pass": str(source.get("pass") or "")}
+        if not src["user"] or not src["pass"]:
+            raise ValueError("Missing IPTV username or password")
+        ident = ("xtream", src["server"], src["user"])
+    elif source.get("type") == "m3u" and str(source.get("url", "")).startswith(("http://", "https://")):
+        src = {"type": "m3u", "url": source["url"], "epg_url": str(source.get("epg_url") or "")}
+        ident = ("m3u", src["url"])
+    else:
+        raise ValueError("Unknown IPTV account type")
+    old_src = LIVE.get("source") or {}
+    old_ident = ("xtream", old_src.get("server"), old_src.get("user")) if old_src.get("type") == "xtream" else ("m3u", old_src.get("url"))
+    # keep channel numbers stable, so Plex/Jellyfin guide mappings survive adding or removing channels
+    old = {c["id"]: c["num"] for c in LIVE["channels"]} if old_ident == ident else {}
+    nxt = max(old.values(), default=0) + 1
+    out, seen = [], set()
+    for c in (channels or [])[:5000]:
+        cid = str(c.get("id", ""))
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        num = old.get(cid)
+        if num is None:
+            num, nxt = nxt, nxt + 1
+        ch = {"id": cid, "num": num, "name": str(c.get("name") or "Channel")[:200], "logo": str(c.get("logo") or "")[:2000],
+              "group": str(c.get("group") or "")[:200], "epg": str(c.get("epg") or "")[:300]}
+        if src["type"] == "m3u":
+            if not str(c.get("url", "")).startswith(("http://", "https://")):
+                continue
+            ch["url"] = c["url"]
+        out.append(ch)
+    out.sort(key=lambda c: c["num"])
+    LIVE.update(source=src, channels=out)
+    if tuners:
+        LIVE["tuners"] = max(1, min(20, int(tuners)))
+    save_live()
+    threading.Thread(target=build_epg, daemon=True).start()
+
+
+def xml_esc(v):
+    return (str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def channels_xml(chans):
+    out = []
+    for c in chans:
+        out.append(f'  <channel id="{c["num"]}"><display-name>{xml_esc(c["name"])}</display-name>'
+                   f'<display-name>{c["num"]}</display-name>'
+                   + (f'<icon src="{xml_esc(c["logo"])}"/>' if c.get("logo") else "") + "</channel>\n")
+    return "".join(out)
+
+
+def build_epg():
+    """Download the provider's guide and keep only the chosen channels, renumbered to match the tuner."""
+    if EPG_STATE["state"] == "building":
+        return
+    EPG_STATE.update(state="building", error="")
+    raw = EPG_FILE.with_name(EPG_FILE.name + ".download")
+    tmp = EPG_FILE.with_name(EPG_FILE.name + ".tmp")
+    try:
+        chans = list(LIVE["channels"])
+        by_id = {}
+        for c in chans:
+            if c.get("epg"):
+                by_id.setdefault(c["epg"].lower(), []).append(str(c["num"]))
+        programmes, matched = 0, set()
+        with open(tmp, "w", encoding="utf-8") as out:
+            out.write('<?xml version="1.0" encoding="UTF-8"?>\n<tv generator-info-name="IPTV Library">\n')
+            out.write(channels_xml(chans))
+            src = live_guide_source()
+            if src and by_id:
+                req = urllib.request.Request(src, headers={"User-Agent": UA})
+                with urllib.request.urlopen(req, timeout=180, context=CTX) as r, open(raw, "wb") as f:
+                    shutil.copyfileobj(r, f, 1 << 20)
+                with open(raw, "rb") as f:
+                    gz = f.read(2) == b"\x1f\x8b"
+                cutoff = (datetime.now(timezone.utc) - timedelta(hours=6)).strftime("%Y%m%d%H%M%S")
+                root = None
+                with (gzip.open(raw, "rb") if gz else open(raw, "rb")) as f:
+                    for ev, el in ET.iterparse(f, events=("start", "end")):
+                        if root is None:
+                            root = el
+                            continue
+                        if ev != "end":
+                            continue
+                        if el.tag == "programme":
+                            nums = by_id.get(el.get("channel", "").lower())
+                            if nums and el.get("stop", "99999999999999")[:14] >= cutoff:
+                                for n in nums:
+                                    el.set("channel", n)
+                                    el.tail = "\n"
+                                    out.write("  " + ET.tostring(el, encoding="unicode"))
+                                    programmes += 1
+                                    matched.add(n)
+                            root.clear()
+                        elif el.tag == "channel":
+                            root.clear()
+            out.write("</tv>\n")
+        os.replace(tmp, EPG_FILE)
+        LIVE.update(epg_programmes=programmes, epg_matched=len(matched))
+        save_live()
+        EPG_STATE.update(state="ready", updated=time.time(), programmes=programmes, matched=len(matched),
+                         error="" if src else "No guide address - channels are listed without programmes")
+    except Exception as e:  # noqa
+        EPG_STATE.update(state="failed", error=str(e)[:300])
+        tmp.unlink() if tmp.exists() else None
+    finally:
+        raw.unlink() if raw.exists() else None
+
+
+def epg_refresher():
+    while True:
+        time.sleep(600)
+        if LIVE["channels"] and EPG_STATE["state"] != "building" and time.time() - (EPG_STATE["updated"] or 0) > 12 * 3600:
+            build_epg()
+
+
+def live_status():
+    src = LIVE.get("source") or {}
+    return {"configured": bool(src and LIVE["channels"]), "source_type": src.get("type"),
+            "source": src.get("server") or urllib.parse.urlsplit(src.get("url", "")).netloc,
+            "user": src.get("user", ""), "channels": LIVE["channels"], "tuners": LIVE["tuners"],
+            "epg": EPG_STATE, "epg_url": LIVE.get("epg_url", ""), "guide_source": bool(live_guide_source()),
+            "in_use": STREAMS["n"]}
+
+
 DL = None  # set in main()
 
 
@@ -676,10 +934,134 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         return False
 
+    def base_url(self):
+        return "http://" + (self.headers.get("Host") or f"127.0.0.1:{self.server.server_address[1]}")
+
+    def tuner(self, path):
+        """Endpoints Plex/Jellyfin call. No app password here (they can't send one) - only your chosen channels."""
+        base, chans = self.base_url(), LIVE["channels"]
+        if path == "/discover.json":
+            return self.send(200, {"FriendlyName": "IPTV Library", "Manufacturer": "Silicondust", "ModelNumber": "HDTC-2US",
+                                   "FirmwareName": "hdhomeruntc_atsc", "FirmwareVersion": "20200101", "TunerCount": LIVE["tuners"],
+                                   "DeviceID": LIVE["device_id"], "DeviceAuth": "iptvlibrary", "BaseURL": base,
+                                   "LineupURL": base + "/lineup.json"})
+        if path == "/lineup_status.json":
+            return self.send(200, {"ScanInProgress": 0, "ScanPossible": 1, "Source": "Cable", "SourceList": ["Cable"]})
+        if path == "/lineup.json":
+            return self.send(200, [{"GuideNumber": str(c["num"]), "GuideName": c["name"],
+                                    "URL": f"{base}/live/stream/{c['num']}.ts"} for c in chans])
+        if path == "/device.xml":
+            return self.send(200, f'''<?xml version="1.0" encoding="UTF-8"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0"><specVersion><major>1</major><minor>0</minor></specVersion>
+<URLBase>{base}</URLBase><device><deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>
+<friendlyName>IPTV Library</friendlyName><manufacturer>Silicondust</manufacturer><modelName>HDTC-2US</modelName>
+<modelNumber>HDTC-2US</modelNumber><serialNumber>{LIVE["device_id"]}</serialNumber><UDN>uuid:{LIVE["device_id"]}</UDN></device></root>''', "application/xml")
+        if path in ("/live/channels.m3u", "/live/playlist.m3u"):
+            lines = [f'#EXTM3U url-tvg="{base}/live/epg.xml" x-tvg-url="{base}/live/epg.xml"']
+            for c in chans:
+                attrs = f'tvg-id="{c["num"]}" tvg-chno="{c["num"]}" tvg-name="{xml_esc(c["name"])}"'
+                if c.get("logo"):
+                    attrs += f' tvg-logo="{xml_esc(c["logo"])}"'
+                if c.get("group"):
+                    attrs += f' group-title="{xml_esc(c["group"])}"'
+                lines += [f"#EXTINF:-1 {attrs},{c['name']}", f"{base}/live/stream/{c['num']}.ts"]
+            return self.send(200, "\n".join(lines) + "\n", "audio/x-mpegurl")
+        if path == "/live/epg.xml":
+            if not EPG_FILE.exists():
+                if chans and EPG_STATE["state"] != "building":
+                    threading.Thread(target=build_epg, daemon=True).start()
+                return self.send(200, '<?xml version="1.0" encoding="UTF-8"?>\n<tv>\n' + channels_xml(chans) + "</tv>\n", "application/xml")
+            size = EPG_FILE.stat().st_size
+            self.send_response(200)
+            self.send_header("Content-Type", "application/xml; charset=utf-8")
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            with open(EPG_FILE, "rb") as f:
+                shutil.copyfileobj(f, self.wfile, 1 << 20)
+            return
+        m = re.fullmatch(r"/live/stream/(\d+)(?:\.ts)?", path)
+        if m:
+            return self.relay(int(m.group(1)))
+        self.send(404, {"error": "Not found"})
+
+    def relay(self, num):
+        ch = next((c for c in LIVE["channels"] if c["num"] == num), None)
+        if not ch:
+            return self.send(404, {"error": "No such channel"})
+        with STREAMS["lock"]:
+            if STREAMS["n"] >= LIVE["tuners"]:
+                return self.send(503, {"error": "All tuners are in use"})
+            STREAMS["n"] += 1
+        try:
+            try:
+                up = urllib.request.urlopen(urllib.request.Request(live_stream_url(ch), headers={"User-Agent": UA}),
+                                            timeout=25, context=CTX)
+            except Exception as e:  # noqa
+                return self.send(502, {"error": f"The IPTV provider didn't send this channel: {e}"})
+            with up:
+                self.send_response(200)
+                ctype = up.headers.get("Content-Type", "")
+                self.send_header("Content-Type", ctype if ctype.startswith("video/") else "video/mp2t")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                read = getattr(up, "read1", up.read)
+                try:
+                    while True:
+                        chunk = read(1 << 16)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                    pass                                # viewer stopped watching
+        finally:
+            with STREAMS["lock"]:
+                STREAMS["n"] -= 1
+
+    def play_video(self, sess):
+        old = sess.get("proc")
+        if old and old.poll() is None:                 # the browser re-requested the video: start it again
+            old.kill()
+            old.wait()
+        errf = tempfile.TemporaryFile()
+        proc = subprocess.Popen(play_command(sess), stdout=subprocess.PIPE, stderr=errf, stdin=subprocess.DEVNULL)
+        sess["proc"], sess["t"] = proc, time.time()
+        try:
+            first = proc.stdout.read1(1 << 16)
+            if not first:
+                proc.wait()
+                errf.seek(0)
+                msg = (errf.read().decode("utf-8", "replace").strip().splitlines() or ["FFmpeg stopped"])[-1][:300]
+                sess["err"] = msg
+                return self.send(502, {"error": msg})
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(first)
+            while True:
+                chunk = proc.stdout.read1(1 << 16)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            pass                                        # viewer closed the player or seeked
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            errf.close()
+
     def do_GET(self):
+        u = urllib.parse.urlsplit(self.path)
+        if u.path in TUNER_PATHS or u.path.startswith("/live/"):
+            try:
+                return self.tuner(u.path)
+            except (BrokenPipeError, ConnectionResetError):
+                return
         if not self.authorised():
             return
-        u = urllib.parse.urlsplit(self.path)
         q = dict(urllib.parse.parse_qsl(u.query, keep_blank_values=True))
         try:
             if u.path == "/":
@@ -716,6 +1098,19 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(200, probe_tracks(q.get("url", "")))
                 except Exception as e:  # noqa
                     return self.send(400, {"error": str(e), "no_ffmpeg": not FFPROBE, "can_install": bool(ffmpeg_installer())})
+            m = re.fullmatch(r"/api/play/([0-9a-f]{16})/(video|subs)", u.path)
+            if m:
+                sess = PLAY.get(m.group(1))
+                if not sess:
+                    return self.send(404, {"error": "This playback has ended"})
+                if m.group(2) == "subs":
+                    try:
+                        return self.send(200, sess["vtt"].read_text(encoding="utf-8", errors="replace"), "text/vtt")
+                    except OSError:
+                        return self.send(200, "WEBVTT\n", "text/vtt")
+                return self.play_video(sess)
+            if u.path == "/api/live":
+                return self.send(200, live_status())
             if u.path == "/api/version":
                 return self.send(200, {"version": VERSION})
             if u.path == "/api/update/check":
@@ -733,6 +1128,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send(502, {"error": str(e)})
 
     def do_POST(self):
+        if urllib.parse.urlsplit(self.path).path == "/lineup.post":     # Plex's "scan channels" - nothing to scan
+            return self.send(200, {})
         # Only accept JSON from this app's own page (blocks other websites poking the local server)
         if not self.authorised():
             return
@@ -745,6 +1142,39 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}")
             p = urllib.parse.urlsplit(self.path).path
+            if p == "/api/play/start":
+                return self.send(200, play_start(body))
+            m = re.fullmatch(r"/api/play/([0-9a-f]{16})/stop", p)
+            if m:
+                play_stop(m.group(1))
+                return self.send(200, {"ok": True})
+            if p == "/api/live/save":
+                live_save(body.get("source"), body.get("channels"), body.get("tuners"))
+                return self.send(200, live_status())
+            if p == "/api/live/settings":
+                if body.get("tuners"):
+                    LIVE["tuners"] = max(1, min(20, int(body["tuners"])))
+                if "epg_url" in body:
+                    url = str(body.get("epg_url") or "").strip()
+                    if url and not url.startswith(("http://", "https://")):
+                        raise ValueError("The guide address must start with http:// or https://")
+                    changed = url != LIVE.get("epg_url", "")
+                    LIVE["epg_url"] = url
+                    if changed and LIVE["channels"]:
+                        threading.Thread(target=build_epg, daemon=True).start()
+                save_live()
+                return self.send(200, live_status())
+            if p == "/api/live/epg/refresh":
+                if LIVE["channels"]:
+                    threading.Thread(target=build_epg, daemon=True).start()
+                    time.sleep(0.2)
+                return self.send(200, live_status())
+            if p == "/api/live/disable":
+                LIVE.update(source=None, channels=[])
+                save_live()
+                EPG_FILE.unlink() if EPG_FILE.exists() else None
+                EPG_STATE.update(state="idle", updated=0, programmes=0, matched=0, error="")
+                return self.send(200, live_status())
             if p == "/api/ffmpeg/install":
                 if not (FFMPEG and FFPROBE) and FF_INSTALL["state"] != "installing":
                     if not ffmpeg_installer():
@@ -834,6 +1264,7 @@ def main():
         srv = ThreadingHTTPServer((a.host, 0), Handler)   # some other program has the port - pick a free one
         a.port = srv.server_address[1]
     DL.restore()
+    threading.Thread(target=epg_refresher, daemon=True).start()
     url = f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}"
     if a.host in ("0.0.0.0", "", "::"):
         print(f"IPTV Library running on port {a.port} - open http://<this-device-ip>:{a.port} on any device on your network")
@@ -920,7 +1351,15 @@ main{overflow:auto;padding:18px}
 .ep .n{color:var(--acc);font-weight:700;width:34px;text-align:center;flex:none}
 .ep .info{flex:1;min-width:0}.ep .info div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ep .info small{color:var(--mute)}.ep button{padding:6px 10px;font-size:12px}
-.player{width:min(1100px,100%)}.player video{width:100%;max-height:80vh;background:#000;border-radius:10px;display:block}
+.player{width:min(1100px,100%)}.player video{width:100%;max-height:78vh;background:#000;border-radius:10px;display:block}
+.pw{position:relative}.pspin{position:absolute;inset:0;display:grid;place-items:center;color:#ddd;pointer-events:none;font-size:15px;text-shadow:0 1px 4px #000}
+.pbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;margin-top:10px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 10px}
+.pbar button{padding:7px 11px;min-width:40px}.pbar select{width:auto;max-width:220px;padding:7px 9px}
+.pbar input[type=range]{width:auto;padding:0;accent-color:var(--acc)}#pSeek{flex:1 1 220px}#pVol{width:80px}
+#pTime{font-variant-numeric:tabular-nums;color:var(--mute);font-size:13px;white-space:nowrap}
+.player:fullscreen{width:100%;background:#000;padding:12px;display:flex;flex-direction:column;justify-content:center}
+.player:fullscreen video{max-height:calc(100vh - 90px)}
+video::cue{background:rgba(0,0,0,.72);font-size:1.05em}
 .pmsg{color:var(--mute);margin-top:10px;text-align:center}
 #dlBtn{position:relative}#dlBadge{position:absolute;top:-6px;right:-6px;background:var(--acc);color:#1a1205;font-size:11px;font-weight:700;border-radius:10px;padding:1px 6px}
 #dl{position:fixed;top:0;right:0;bottom:0;width:min(460px,100%);background:var(--panel);border-left:1px solid var(--line);z-index:15;display:flex;flex-direction:column;box-shadow:-10px 0 40px #0008}
@@ -954,6 +1393,22 @@ main{overflow:auto;padding:18px}
 .tk label{margin:6px 0 0}.tk .note{color:var(--mute);font-size:13px;margin:0}
 #dl .prefs{display:flex;flex-direction:column;gap:8px;border-top:1px solid var(--line);padding-top:10px}
 #dl .prefs .chk{margin:0;font-size:13px}#ffNote{color:var(--acc2)}
+.grid.rows{grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:8px}
+.lrow{display:flex;align-items:center;gap:12px;padding:8px 12px;border-radius:10px;background:var(--panel);border:1px solid var(--line);cursor:pointer;margin:0;color:var(--text);font-size:14px}
+.lrow:hover{border-color:var(--acc)}.lrow.on{border-color:var(--acc);background:#2a2213}
+.lrow input{width:20px;height:20px;flex:none;accent-color:var(--acc);margin:0}
+.lrow .lnum{width:34px;flex:none;text-align:right;color:var(--acc);font-weight:700;font-variant-numeric:tabular-nums}
+.lrow .llogo{width:56px;height:36px;flex:none;border-radius:6px;background:var(--panel2);display:grid;place-items:center;overflow:hidden;color:var(--mute);font-size:12px;font-weight:700;position:relative}
+.lrow .llogo img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--panel2)}
+.lrow .lname{flex:1;min-width:0;display:flex;flex-direction:column}.lrow .lname span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lrow small{color:var(--mute);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#liveBar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}#liveBar select{width:auto}
+#liveDirty{color:var(--acc2);font-size:13px}
+.cat b.sel{color:var(--acc);opacity:1}
+.setup{padding:26px;display:flex;flex-direction:column;gap:14px}.setup h2{margin:0;padding-right:40px}.setup h3{margin:6px 0 0;font-size:15px}
+.setup ol{margin:0;padding-left:20px;color:#c9ccd4;display:flex;flex-direction:column;gap:4px}
+.addr{display:flex;gap:8px;align-items:center}.addr code{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px 11px;font-size:13px;overflow:auto;white-space:nowrap}
+.setup .note{color:var(--mute);font-size:13px;margin:0}.setup .warn{color:var(--acc2);font-size:13px;margin:0}
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--acc);color:#1a1205;padding:9px 16px;border-radius:8px;font-weight:600;z-index:20}
 @media (max-width:760px){#app{grid-template-columns:1fr}aside{display:none}header{flex-wrap:wrap}.mbody{flex-direction:column;margin-top:-60px}.mbody h2{margin-top:0}}
 </style></head><body>
@@ -984,7 +1439,7 @@ main{overflow:auto;padding:18px}
     <h1 class="brand">IPTV <span>Library</span></h1>
     <button id="verBtn" title="Check for updates">v…</button>
     <button id="updBtn" class="pri hidden">⬆ Update</button>
-    <div class="tabs"><button data-tab="movies" class="on">Movies</button><button data-tab="series">TV Shows</button></div>
+    <div class="tabs"><button data-tab="movies" class="on">Movies</button><button data-tab="series">TV Shows</button><button data-tab="live">Live TV</button></div>
     <input id="q" placeholder="Search…">
     <select id="sort"><option value="name">A – Z</option><option value="added">Recently added</option><option value="rating">Top rated</option></select>
     <div class="grow"></div>
@@ -994,7 +1449,14 @@ main{overflow:auto;padding:18px}
   </header>
   <aside><input id="cq" placeholder="Filter categories…"><div id="cats"></div></aside>
   <main>
-    <div class="bar"><span id="count"></span><div class="grow"></div>
+    <div class="bar"><span id="count"></span>
+      <div id="liveBar" class="hidden">
+        <select id="liveShow" aria-label="Which channels to show"><option value="all">All channels</option><option value="sel">Ticked only</option></select>
+        <button id="liveAll">Tick all shown</button><button id="liveNone">Untick all shown</button>
+        <button id="liveSave" class="pri">Save channels</button><span id="liveDirty"></span>
+        <button id="liveSetup">📺 Plex &amp; Jellyfin setup</button>
+      </div>
+      <div class="grow"></div>
       <button id="expM3u">Export .m3u</button><button id="expCsv">Export .csv</button><button id="reload">Refresh</button></div>
     <div class="grid" id="grid"></div><div id="sentinel"></div>
   </main>
@@ -1021,7 +1483,7 @@ main{overflow:auto;padding:18px}
       <select id="dlWorkers" style="width:auto"><option>1</option><option>2</option><option>3</option><option>4</option></select>
       <small>Keep within your account's connection limit</small></div>
     <div class="prefs">
-      <label style="margin:0">Audio &amp; subtitles (when a title has a choice)</label>
+      <label style="margin:0">Audio &amp; subtitles: pre-selected when a download has a choice</label>
       <div class="frow"><span>Audio</span><select id="pAudio" style="grid-column:span 2" aria-label="Preferred audio language"></select></div>
       <div class="frow"><span>Subtitles</span><select id="pSub" style="grid-column:span 2" aria-label="Preferred subtitle language"></select></div>
       <label class="chk"><input type="checkbox" id="pKeep"> Keep the other audio languages too</label>
@@ -1038,7 +1500,7 @@ main{overflow:auto;padding:18px}
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const PAGE = 120;
-const S = {mode:null, server:'', user:'', pass:'', m3uUrl:'', m3u:null, tab:'movies', cache:{}, cats:[], items:[], cat:'all', view:[], shown:0};
+const S = {sel:new Map(), nums:{}, live:null, liveDirty:false, mode:null, server:'', user:'', pass:'', m3uUrl:'', m3u:null, tab:'movies', cache:{}, cats:[], items:[], cat:'all', view:[], shown:0};
 
 async function api(path, params){
   const r = await fetch(path + '?' + new URLSearchParams(params));
@@ -1098,15 +1560,31 @@ async function switchTab(tab, refresh){
   S.tab = tab; S.cat = 'all'; $('#q').value = ''; $('#cq').value = '';
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
   $('#expM3u').classList.toggle('hidden', tab !== 'movies');
-  $('#grid').innerHTML = '<div class="loading" style="grid-column:1/-1">Loading ' + (tab==='movies'?'movies':'TV shows') + '… big libraries can take a moment.</div>';
+  $('#expCsv').classList.toggle('hidden', tab === 'live');
+  $('#liveBar').classList.toggle('hidden', tab !== 'live');
+  $('#grid').classList.toggle('rows', tab === 'live');
+  $('#grid').innerHTML = '<div class="loading" style="grid-column:1/-1">Loading ' + ({movies:'movies', series:'TV shows', live:'channels'})[tab] + '… big libraries can take a moment.</div>';
   $('#cats').innerHTML = ''; $('#count').textContent = '';
   try {
     if (refresh || !S.cache[tab]) S.cache[tab] = await fetchTab(tab, refresh);
     ({cats:S.cats, items:S.items} = S.cache[tab]);
+    if (tab === 'live') await loadLive();
     renderCats(); applyFilter();
   } catch(e) { $('#grid').innerHTML = `<div class="empty" style="grid-column:1/-1">Couldn't load: ${esc(e.message)}</div>`; }
 }
 async function fetchTab(tab, refresh){
+  if (tab === 'live') {
+    if (S.mode === 'xtream') {
+      const [cats, items] = await Promise.all([xt('get_live_categories'), xt('get_live_streams')]);
+      return { cats: (Array.isArray(cats)?cats:[]).map(c => ({id:String(c.category_id), name:c.category_name})),
+               items: (Array.isArray(items)?items:[]).map((it, i) => ({id:String(it.stream_id), name:it.name || 'Channel', img:it.stream_icon,
+                 cat:String(it.category_id), epg:it.epg_channel_id || '', added:+it.added || 0, rating:0, order:i})) };
+    }
+    if (refresh) S.m3u = await api('/api/m3u', {url:S.m3uUrl, refresh:1});
+    const list = S.m3u.live || [];
+    return { cats: [...new Set(list.map(x => x.group))].map(g => ({id:g, name:g})),
+             items: list.map((x, i) => ({id:x.url, name:x.name, img:x.logo, cat:x.group, epg:x.epg || '', url:x.url, added:i, rating:0, order:i})) };
+  }
   if (S.mode === 'xtream') {
     const mv = tab === 'movies';
     const [cats, items] = await Promise.all([xt(mv?'get_vod_categories':'get_series_categories'), xt(mv?'get_vod_streams':'get_series')]);
@@ -1128,7 +1606,9 @@ function renderCats(){
   const f = $('#cq').value.toLowerCase();
   const rows = [{id:'all', name:'All', n:S.items.length}, ...S.cats.filter(c => counts[c.id]).map(c => ({...c, n:counts[c.id]}))]
     .filter(c => c.id === 'all' || !f || c.name.toLowerCase().includes(f));
-  $('#cats').innerHTML = rows.map(c => `<div class="cat ${c.id===S.cat?'on':''}" data-id="${esc(c.id)}"><span>${esc(c.name)}</span><b>${c.n}</b></div>`).join('');
+  const ticked = {}; if (S.tab === 'live') S.items.forEach(i => { if (S.sel.has(i.id)) { ticked[i.cat] = (ticked[i.cat] || 0) + 1; ticked.all = (ticked.all || 0) + 1; } });
+  $('#cats').innerHTML = rows.map(c => `<div class="cat ${c.id===S.cat?'on':''}" data-id="${esc(c.id)}"><span>${esc(c.name)}</span>`
+    + (ticked[c.id] ? `<b class="sel">${ticked[c.id]}/${c.n}</b>` : `<b>${c.n}</b>`) + '</div>').join('');
 }
 $('#cats').onclick = e => { const c = e.target.closest('.cat'); if (!c) return; S.cat = c.dataset.id; renderCats(); applyFilter(); };
 $('#cq').oninput = renderCats;
@@ -1138,10 +1618,11 @@ $('#reload').onclick = () => switchTab(S.tab, true);
 
 function applyFilter(){
   const q = $('#q').value.trim().toLowerCase(), sort = $('#sort').value;
-  let v = S.items.filter(i => (S.cat === 'all' || i.cat === S.cat) && (!q || i.name.toLowerCase().includes(q)));
-  v.sort(sort === 'added' ? (a,b) => b.added - a.added : sort === 'rating' ? (a,b) => b.rating - a.rating : (a,b) => a.name.localeCompare(b.name));
+  const onlySel = S.tab === 'live' && $('#liveShow').value === 'sel';
+  let v = S.items.filter(i => (S.cat === 'all' || i.cat === S.cat) && (!q || i.name.toLowerCase().includes(q)) && (!onlySel || S.sel.has(i.id)));
+  v.sort(sort === 'added' ? (a,b) => b.added - a.added : sort === 'rating' ? (a,b) => (b.rating - a.rating) || ((a.order ?? 0) - (b.order ?? 0)) : (a,b) => a.name.localeCompare(b.name));
   S.view = v; S.shown = 0; $('#grid').innerHTML = '';
-  $('#count').textContent = `${v.length.toLocaleString()} ${S.tab === 'movies' ? 'movies' : 'shows'}`;
+  $('#count').textContent = `${v.length.toLocaleString()} ${({movies:'movies', series:'shows', live:'channels'})[S.tab]}` + (S.tab === 'live' ? ` · ${S.sel.size} ticked` : '');
   if (!v.length) $('#grid').innerHTML = '<div class="empty" style="grid-column:1/-1">Nothing here.</div>';
   more();
 }
@@ -1149,6 +1630,13 @@ const initials = n => esc((n.replace(/[^\p{L}\p{N} ]/gu,'').trim().split(/\s+/).
 function poster(src, name){ return `${initials(name)}${src ? `<img loading="lazy" src="${esc(src)}" onerror="this.remove()">` : ''}`; }
 function more(){
   const slice = S.view.slice(S.shown, S.shown + PAGE);
+  if (S.tab === 'live') {
+    $('#grid').insertAdjacentHTML('beforeend', slice.map((it, k) => { const on = S.sel.has(it.id), num = S.nums[it.id];
+      return `<label class="lrow ${on ? 'on' : ''}"><input type="checkbox" data-ck="${S.shown + k}"${on ? ' checked' : ''} aria-label="${esc(it.name)}">
+        <span class="lnum">${num ? num : ''}</span><span class="llogo">${poster(it.img, it.name)}</span>
+        <span class="lname"><span title="${esc(it.name)}">${esc(it.name)}</span><small>${esc(catName(it.cat))}${it.epg ? '' : ' · no guide ID'}</small></span></label>`; }).join(''));
+    S.shown += slice.length; return;
+  }
   $('#grid').insertAdjacentHTML('beforeend', slice.map((it,k) => `<div class="tile" data-i="${S.shown+k}">
     <div class="poster">${poster(it.img, it.name)}${it.rating ? `<span class="rate">★ ${it.rating.toFixed(1)}</span>` : ''}</div>
     <div class="t" title="${esc(it.name)}">${esc(it.name)}</div></div>`).join(''));
@@ -1156,10 +1644,13 @@ function more(){
 }
 new IntersectionObserver(es => { if (es[0].isIntersecting && S.shown < S.view.length) more(); }, {root:$('main'), rootMargin:'600px'}).observe($('#sentinel'));
 $('#grid').onclick = e => { const t = e.target.closest('.tile'); if (t) (S.tab === 'movies' ? openMovie : openShow)(S.view[+t.dataset.i]); };
+$('#grid').addEventListener('change', e => { const c = e.target.closest('[data-ck]'); if (!c) return;
+  const it = S.view[+c.dataset.ck]; if (c.checked) S.sel.set(it.id, it); else S.sel.delete(it.id);
+  c.closest('.lrow').classList.toggle('on', c.checked); liveDirty(true); renderCats(); });
 
 /* ---------- details ---------- */
 function overlay(html, cls='modal'){ const o = $('#ov'); o.innerHTML = `<div class="${cls}"><button class="x" data-close>✕</button>${html}</div>`; o.classList.remove('hidden'); return o.firstChild; }
-function closeOv(){ const o = $('#ov'); o.querySelectorAll('video').forEach(v => { v.pause(); v.removeAttribute('src'); v.load(); }); o.classList.add('hidden'); o.innerHTML = ''; }
+function closeOv(){ stopPlayer(); const o = $('#ov'); o.querySelectorAll('video').forEach(v => { v.pause(); v.removeAttribute('src'); v.load(); }); o.classList.add('hidden'); o.innerHTML = ''; }
 $('#ov').addEventListener('click', e => { if (e.target.id === 'ov' || e.target.closest('[data-close]')) closeOv(); });
 document.addEventListener('keydown', e => { if (e.key !== 'Escape') return;
   const t = document.getElementById('trk'); if (t && !t.classList.contains('hidden')) { t.classList.add('hidden'); t.innerHTML = ''; } else closeOv(); });
@@ -1177,7 +1668,6 @@ function epDl(show, season, e){
 }
 const actBtns = (url, title, dlk) => `<button class="pri" data-play="${esc(url)}" data-title="${esc(title)}" data-dlk="${dlk || ''}">▶ Play</button>
   ${dlk ? `<button data-dl="${dlk}">⬇ Download</button>` : ''}
-  ${dlk ? `<button data-trk="${dlk}">🎧 Audio &amp; subtitles</button>` : ''}
   <button data-vlc="${esc(url)}" data-title="${esc(title)}" data-dlk="${dlk || ''}">Open in VLC (.m3u)</button><button data-copy="${esc(url)}">Copy link</button>`;
 function header(o){
   return `<div class="hero" style="${o.backdrop ? `background-image:url('${esc(o.backdrop)}')` : ''}"></div>
@@ -1245,14 +1735,97 @@ async function openShow(it){
 document.addEventListener('click', e => {
   const b = e.target.closest('button'); if (!b) return;
   if (b.dataset.play) play(b.dataset.play, b.dataset.title, b.dataset.dlk);
-  else if (b.dataset.dl) queueDownloads(DLREG.get(b.dataset.dl));
-  else if (b.dataset.trk) openTracks(b.dataset.trk);
+  else if (b.dataset.dl) startDownload(DLREG.get(b.dataset.dl));
   else if (b.dataset.vlc) { const it = b.dataset.dlk && (DLREG.get(b.dataset.dlk) || [])[0];
     downloadM3u(b.dataset.title, [{title:b.dataset.title, url:b.dataset.vlc, opts: it ? vlcOpts(it) : null}]); }
   else if (b.dataset.copy) navigator.clipboard.writeText(b.dataset.copy).then(() => toast('Link copied'), () => prompt('Copy this link:', b.dataset.copy));
 });
-function play(url, title, dlk){
-  const p = overlay(`<video controls autoplay src="${esc(url)}"></video><div class="pmsg">${esc(title)}</div>`, 'player');
+/* ---------- player: pick audio & subtitles while watching (needs FFmpeg on the server) ---------- */
+let PLAYER = null;
+const fmtClock = t => { t = Math.max(0, Math.floor(t || 0)); const h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), x = t % 60;
+  return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(x).padStart(2, '0'); };
+function vttCues(text){
+  const out = [], re = /(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{3})[ \t]+-->[ \t]+(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{3})[^\n]*\n([\s\S]*?)(?=\n\s*\n|$)/g;
+  let m; const sec = (h, mi, s, ms) => (+h || 0) * 3600 + (+mi) * 60 + (+s) + (+ms) / 1000;
+  while ((m = re.exec(text))) out.push([sec(m[1], m[2], m[3], m[4]), sec(m[5], m[6], m[7], m[8]), m[9].replace(/<[^>]+>/g, '').trim()]);
+  return out;
+}
+async function play(url, title, dlk){
+  stopPlayer();
+  if (!FF) return playDirect(url, title, dlk);
+  const p = overlay(`<div class="pw"><video id="pv" autoplay playsinline></video><div class="pspin" id="pspin">Getting ready…</div></div>
+    <div class="pbar hidden" id="pbar">
+      <button id="pPlay" aria-label="Pause">⏸</button><span id="pTime">0:00</span>
+      <input type="range" id="pSeek" min="0" value="0" step="1" aria-label="Position">
+      <input type="range" id="pVol" min="0" max="1" step="0.05" value="1" aria-label="Volume">
+      <select id="pA" aria-label="Audio language"></select><select id="pS" aria-label="Subtitles"></select>
+      <button id="pFull" aria-label="Full screen">⛶</button>
+    </div><div class="pmsg">${esc(title)}</div>`, 'player');
+  let tr = null;
+  try { tr = await api('/api/tracks', {url}); } catch(e) {}
+  if (!p.isConnected) return;
+  if (!tr) return playDirect(url, title, dlk, p);            // couldn't look inside - fall back to the plain player
+  const v = p.querySelector('#pv'), textSubs = tr.subs.filter(x => x.text);
+  const a0 = prefA(tr.audio), s0 = prefS(textSubs);
+  const P = PLAYER = {url, title, dlk, tr, v, p, offset:0, sid:null, audio:a0 ? a0.index : null, subs:s0 ? s0.index : null, cues:0, timer:null, drag:false};
+  p.querySelector('#pA').innerHTML = tr.audio.map(a => `<option value="${a.index}"${a0 && a.index === a0.index ? ' selected' : ''}>🔊 ${esc(aLabel(a))}</option>`).join('');
+  p.querySelector('#pA').classList.toggle('hidden', tr.audio.length < 2);
+  p.querySelector('#pS').innerHTML = '<option value="">Subtitles off</option>' + textSubs.map(x => `<option value="${x.index}"${s0 && x.index === s0.index ? ' selected' : ''}>CC ${esc(sLabel(x))}</option>`).join('');
+  p.querySelector('#pS').classList.toggle('hidden', !textSubs.length);
+  const seek = p.querySelector('#pSeek');
+  seek.max = Math.floor(tr.duration || 0); seek.classList.toggle('hidden', !tr.duration);
+  p.querySelector('#pbar').classList.remove('hidden');
+  if (/^(hevc|h265)$/i.test(tr.video) && window.MediaSource && !MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"'))
+    p.querySelector('.pmsg').innerHTML = `${esc(title)}<br><span style="color:var(--acc2)">This video is HEVC (H.265), which this browser may not play. If it stays black, use Open in VLC.</span>`;
+  const track = v.addTextTrack('subtitles', 'Subtitles'); track.mode = 'showing';
+  const spin = t => { const el = p.querySelector('#pspin'); el.textContent = t || ''; el.classList.toggle('hidden', !t); };
+  const pos = () => P.offset + (v.currentTime || 0);
+  const clearCues = () => { while (track.cues && track.cues.length) track.removeCue(track.cues[0]); P.cues = 0; };
+  const pollSubs = async () => {
+    clearTimeout(P.timer); if (P.subs == null || !P.sid || !p.isConnected) return;
+    try { const r = await fetch(`/api/play/${P.sid}/subs`); if (r.ok) {
+      const cues = vttCues(await r.text());
+      for (let i = P.cues; i < cues.length; i++) { const [a, b, t] = cues[i]; if (t) try { track.addCue(new VTTCue(a, b, t)); } catch(e) {} }
+      P.cues = Math.max(P.cues, cues.length); } } catch(e) {}
+    P.timer = setTimeout(pollSubs, P.fast-- > 0 ? 700 : 3000);      // quick at first, so opening lines aren't missed
+  };
+  P.gen = 0;
+  const startAt = async t => {
+    const gen = ++P.gen;                                    // only the newest request (seek/track change) wins
+    spin('Loading…'); clearCues(); clearTimeout(P.timer);
+    let r;
+    try { r = await post('/api/play/start', {url, audio:P.audio, subs:P.subs, start:t, previous:P.sid}); }
+    catch(e) { if (gen === P.gen) { spin(''); p.querySelector('.pmsg').textContent = e.message; } return; }
+    if (gen !== P.gen || PLAYER !== P) { post(`/api/play/${r.sid}/stop`).catch(() => {}); return; }
+    P.sid = r.sid; P.offset = t; P.fast = 10; v.src = `/api/play/${P.sid}/video`; v.play().catch(() => {}); pollSubs();
+  };
+  v.addEventListener('playing', () => { spin(''); p.querySelector('#pPlay').textContent = '⏸'; });
+  v.addEventListener('pause', () => p.querySelector('#pPlay').textContent = '▶');
+  v.addEventListener('waiting', () => spin('Loading…'));
+  v.addEventListener('timeupdate', () => { if (!P.drag) seek.value = Math.floor(pos());
+    p.querySelector('#pTime').textContent = fmtClock(pos()) + (tr.duration ? ' / ' + fmtClock(tr.duration) : ''); });
+  v.addEventListener('error', () => { if (!v.getAttribute('src')) return; spin('');
+    p.querySelector('.pmsg').innerHTML = `${esc(title)}<br><span style="color:var(--bad)">This video couldn't be played in the browser.</span>
+      <div class="actions" style="justify-content:center;margin-top:10px"><button id="pDirect">Try the original stream</button>${actBtns(url, title, dlk).replace(/<button class="pri"[^]*?<\/button>/, '')}</div>`;
+    p.querySelector('#pDirect').onclick = () => { closeOv(); playDirect(url, title, dlk); }; });
+  p.querySelector('#pPlay').onclick = () => v.paused ? v.play() : v.pause();
+  v.onclick = () => v.paused ? v.play() : v.pause();
+  seek.oninput = () => { P.drag = true; p.querySelector('#pTime').textContent = fmtClock(+seek.value) + ' / ' + fmtClock(tr.duration); };
+  seek.onchange = () => { P.drag = false; startAt(+seek.value); };
+  p.querySelector('#pVol').oninput = e => { v.volume = +e.target.value; };
+  p.querySelector('#pA').onchange = e => { P.audio = +e.target.value; startAt(pos()); };
+  p.querySelector('#pS').onchange = e => { P.subs = e.target.value === '' ? null : +e.target.value; startAt(pos()); };
+  p.querySelector('#pFull').onclick = () => document.fullscreenElement ? document.exitFullscreen() : p.requestFullscreen && p.requestFullscreen();
+  startAt(0);
+}
+function stopPlayer(){
+  if (PLAYER) { clearTimeout(PLAYER.timer); if (PLAYER.sid) post(`/api/play/${PLAYER.sid}/stop`).catch(() => {}); PLAYER = null; }
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+}
+function playDirect(url, title, dlk, into){
+  const p = into || overlay('', 'player');
+  if (into) [...p.childNodes].forEach(n => { if (!n.matches || !n.matches('.x')) n.remove(); });
+  p.insertAdjacentHTML('beforeend', `<video controls autoplay src="${esc(url)}"></video><div class="pmsg">${esc(title)}</div>`);
   p.querySelector('video').onerror = () => { p.querySelector('.pmsg').innerHTML = `${esc(title)}<br><span style="color:var(--bad)">Your browser can't play this file format (common with .mkv).</span>
      <div class="actions" style="justify-content:center;margin-top:10px">${actBtns(url, title, dlk).replace(/<button class="pri"[^]*?<\/button>/, '')}</div>`; };
 }
@@ -1418,10 +1991,8 @@ const savePrefs = async () => {
 const LANG2 = {eng:'en', spa:'es', fre:'fr', ger:'de', ita:'it', por:'pt', dut:'nl', pol:'pl', tur:'tr', ara:'ar', hin:'hi', rus:'ru', jpn:'ja', kor:'ko', chi:'zh', swe:'sv', nor:'no', dan:'da', fin:'fi', gre:'el', heb:'he', per:'fa', rum:'ro', hun:'hu', cze:'cs', ukr:'uk'};
 function vlcOpts(it){
   const o = [];
-  if (Number.isInteger(it.audio_n)) o.push(`audio-track=${it.audio_n}`);
-  else o.push(`audio-language=${[PREFS.audio_lang, LANG2[PREFS.audio_lang]].filter(Boolean).join(',')},any`);
+  o.push(`audio-language=${[PREFS.audio_lang, LANG2[PREFS.audio_lang]].filter(Boolean).join(',')},any`);
   if (it.subs === 'none' || (it.subs == null && PREFS.sub_lang === 'off')) o.push('sub-track=-1', 'sub-language=none');
-  else if (Number.isInteger(it.subs_n)) o.push(`sub-track=${it.subs_n}`);
   else o.push(`sub-language=${[PREFS.sub_lang, LANG2[PREFS.sub_lang]].filter(Boolean).join(',')}`);
   return o;
 }
@@ -1434,57 +2005,132 @@ function prefS(subs){ if (PREFS.sub_lang === 'off') return null;
   return subs.filter(x => x.lang === PREFS.sub_lang).sort((a, b) => (a.forced - b.forced) || (b.text - a.text))[0] || null; }
 function trkClose(){ $('#trk').classList.add('hidden'); $('#trk').innerHTML = ''; }
 $('#trk').addEventListener('click', e => { if (e.target.id === 'trk' || e.target.closest('[data-tclose]')) trkClose(); });
-async function openTracks(k){
-  const it = (DLREG.get(k) || [])[0]; if (!it) return;
-  const o = $('#trk');
-  o.innerHTML = `<div class="modal"><button class="x" data-tclose aria-label="Close">✕</button><div class="tk"><h2>${esc(it.title)}</h2>
-    <p class="note">Checking which audio and subtitle tracks this file has…</p></div></div>`;
+async function startDownload(items){
+  if (!items || !items.length) return;
+  if (!FF) return queueDownloads(items);                     // can't change tracks without FFmpeg - just download
+  const it = items[0], many = items.length > 1, o = $('#trk');
+  const head = many ? `${esc(it.title.replace(/ S\d+E\d+.*$/, ''))} · ${items.length} episodes` : esc(it.title);
+  o.innerHTML = `<div class="modal"><button class="x" data-tclose aria-label="Close">✕</button><div class="tk"><h2>${head}</h2>
+    <p class="note">Checking the audio and subtitles…</p></div></div>`;
   o.classList.remove('hidden');
-  let tr;
-  try {
-    const r = await fetch('/api/tracks?' + new URLSearchParams({url:it.url})); tr = await r.json();
-    if (!r.ok) throw Object.assign(new Error(tr.error || 'Error ' + r.status), tr);
-  } catch(e) {
-    const box = o.querySelector('.tk');
-    if (e.no_ffmpeg) {
-      FF_CAN = !!e.can_install;
-      box.innerHTML = `<h2>${esc(it.title)}</h2>
-        <p>Audio and subtitle choices need <b>FFmpeg</b>, which isn't installed yet.</p>
-        <p class="note">Until it is, downloads keep every audio track and subtitle exactly as they are in the file.</p>
-        ${FF_CAN ? '<p class="note">The app can install it for you, which takes about a minute. If the container is ever re-created, it\'s needed again, unless you use the latest docker-compose.yml from GitHub, which installs it automatically.</p>'
-                 : '<p class="note">Install FFmpeg on this computer, or switch to the latest docker-compose.yml from GitHub, which installs it.</p>'}
-        <div class="actions">${FF_CAN ? '<button class="pri" id="tFF">Install FFmpeg</button>' : ''}<button data-tclose>Close</button></div>`;
-      const b = box.querySelector('#tFF');
-      if (b) b.onclick = async () => { b.disabled = true; b.textContent = 'Installing FFmpeg… (about a minute)';
-        if (await installFF()) openTracks(k); else { b.disabled = false; b.textContent = 'Try again'; box.querySelector('.note').textContent = ffStateText(); } };
-    } else box.innerHTML = `<h2>${esc(it.title)}</h2><p class="note">${esc(e.message)}</p>
-        <p class="note">Downloads will use your default languages from the Downloads panel if the file has them.</p>
-        <div class="actions"><button data-tclose>Close</button></div>`;
-    return;
-  }
+  let tr = null;
+  try { tr = await api('/api/tracks', {url:it.url}); } catch(e) {}
+  if (o.classList.contains('hidden')) return;                // closed while checking
+  if (!tr || (tr.audio.length < 2 && !tr.subs.length)) { trkClose(); return queueDownloads(items); }   // nothing to choose
   const a0 = Number.isInteger(it.audio) ? tr.audio.find(a => a.index === it.audio) : prefA(tr.audio);
   const s0 = it.subs === 'none' ? null : Number.isInteger(it.subs) ? tr.subs.find(x => x.index === it.subs) : prefS(tr.subs);
-  o.querySelector('.tk').innerHTML = `<h2>${esc(it.title)}</h2>
+  o.querySelector('.tk').innerHTML = `<h2>${head}</h2>
+    <p class="note">${many ? 'The first episode has more than one option. Your choice is applied to every episode by language.'
+                           : 'This title has more than one option. Choose what to keep in the download.'}</p>
     <label for="tA">Audio</label>
-    ${tr.audio.length ? `<select id="tA">${tr.audio.map(a => `<option value="${a.index}"${a0 && a.index === a0.index ? ' selected' : ''}>${esc(aLabel(a))}</option>`).join('')}</select>`
-                      : '<p class="note">No separate audio tracks found.</p>'}
+    <select id="tA">${tr.audio.map(a => `<option value="${a.index}"${a0 && a.index === a0.index ? ' selected' : ''}>${esc(aLabel(a))}</option>`).join('')}</select>
     <label for="tS">Subtitles</label>
     <select id="tS"><option value="none">None</option>${tr.subs.map(x => `<option value="${x.index}"${s0 && x.index === s0.index ? ' selected' : ''}>${esc(sLabel(x))}</option>`).join('')}</select>
-    ${tr.subs.length ? '' : '<p class="note">This file has no subtitle tracks.</p>'}
-    <p class="note">${tr.audio.length < 2 && !tr.subs.length ? 'This file only has one audio track and no subtitles, so there\'s nothing to choose.'
-      : 'Your choice is used when you download this title and when you open it in VLC.' + (FF ? '' : ' (Downloads need FFmpeg to apply it.)')}
-      Playing in the browser always uses the file's default track.</p>
-    <div class="actions"><button class="pri" id="tDl">⬇ Download with these</button><button id="tVlc">Open in VLC</button><button data-tclose>Done</button></div>`;
-  const keep = () => {
-    const ai = o.querySelector('#tA') ? +o.querySelector('#tA').value : null, sv = o.querySelector('#tS').value;
-    const a = tr.audio.find(x => x.index === ai), sb = tr.subs.find(x => x.index === +sv);
-    it.audio = a ? a.index : null; it.audio_n = a ? a.n : null;
-    it.subs = sv === 'none' ? 'none' : (sb ? sb.index : null); it.subs_n = sb ? sb.n : null;
+    <div class="actions"><button class="pri" id="tDl">⬇ Download${many ? ` ${items.length} episodes` : ''}</button><button data-tclose>Cancel</button></div>`;
+  o.querySelector('#tDl').onclick = () => {
+    const a = tr.audio.find(x => x.index === +o.querySelector('#tA').value), sv = o.querySelector('#tS').value;
+    const sb = sv === 'none' ? null : tr.subs.find(x => x.index === +sv);
+    for (const x of items) {
+      if (!many) { x.audio = a ? a.index : null; x.subs = sb ? sb.index : 'none'; continue; }
+      // other episodes may order tracks differently, so match by language (or by position when untagged)
+      if (a && a.lang) x.alang = a.lang; else if (a) x.audio = a.index;
+      if (!sb) x.subs = 'none'; else if (sb.lang) x.slang = sb.lang; else x.subs = sb.index;
+    }
+    trkClose(); queueDownloads(items);
   };
-  o.querySelectorAll('select').forEach(x => x.onchange = keep); keep();
-  o.querySelector('#tDl').onclick = () => { keep(); queueDownloads([it]); trkClose(); };
-  o.querySelector('#tVlc').onclick = () => { keep(); downloadM3u(it.title, [{title:it.title, url:it.url, opts:vlcOpts(it)}]); };
 }
+
+/* ---------- live TV ---------- */
+async function loadLive(){
+  try { S.live = await api('/api/live', {}); } catch(e) { S.live = {channels:[]}; }
+  if (!S.liveDirty) {
+    S.sel = new Map(); const byId = new Map(S.items.map(i => [i.id, i]));
+    for (const c of S.live.channels || []) S.sel.set(c.id, byId.get(c.id) || {id:c.id, name:c.name, img:c.logo, cat:c.group, epg:c.epg, url:c.url, order:1e9});
+  }
+  S.nums = Object.fromEntries((S.live.channels || []).map(c => [c.id, c.num]));
+  liveDirty(S.liveDirty);
+}
+function liveDirty(on){
+  S.liveDirty = on;
+  $('#liveDirty').textContent = on ? 'Unsaved changes' : (S.live && S.live.channels && S.live.channels.length ? `${S.live.channels.length} channels on Plex/Jellyfin` : '');
+  $('#liveSave').textContent = `Save channels (${S.sel.size})`;
+  if (S.tab === 'live') $('#count').textContent = `${S.view.length.toLocaleString()} channels · ${S.sel.size} ticked`;
+}
+$('#liveShow').onchange = applyFilter;
+const bulk = on => { for (const it of S.view) on ? S.sel.set(it.id, it) : S.sel.delete(it.id);
+  $('#grid').querySelectorAll('[data-ck]').forEach(c => { c.checked = on; c.closest('.lrow').classList.toggle('on', on); });
+  liveDirty(true); renderCats(); if ($('#liveShow').value === 'sel' && !on) applyFilter(); };
+$('#liveAll').onclick = () => { if (S.view.length > 500 && !confirm(`Tick all ${S.view.length} channels shown?`)) return; bulk(true); };
+$('#liveNone').onclick = () => bulk(false);
+function liveSource(){
+  return S.mode === 'xtream' ? {type:'xtream', server:S.server, user:S.user, pass:S.pass}
+                             : {type:'m3u', url:S.m3uUrl, epg_url:(S.m3u && S.m3u.epg_url) || ''};
+}
+$('#liveSave').onclick = async () => {
+  const order = new Map(S.items.map((i, n) => [i.id, n]));
+  const chans = [...S.sel.values()].sort((a, b) => (order.get(a.id) ?? 1e9) - (order.get(b.id) ?? 1e9))
+    .map(i => ({id:i.id, name:i.name, logo:i.img || '', group:catName(i.cat) || i.cat || '', epg:i.epg || '', url:i.url || ''}));
+  const b = $('#liveSave'); b.disabled = true;
+  try { S.live = await post('/api/live/save', {source:liveSource(), channels:chans});
+        S.nums = Object.fromEntries(S.live.channels.map(c => [c.id, c.num])); liveDirty(false); applyFilter();
+        toast(chans.length ? `Saved ${chans.length} channels. Plex & Jellyfin will see them` : 'Live TV channels cleared');
+        if (chans.length && !localStorage.getItem('iptvSetupSeen')) { try { localStorage.setItem('iptvSetupSeen', '1'); } catch(e) {} showLiveSetup(); } }
+  catch(e) { toast('Couldn\'t save: ' + e.message); }
+  finally { b.disabled = false; }
+};
+const ago = t => { if (!t) return 'never'; const m = Math.round((Date.now() / 1000 - t) / 60);
+  return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : m < 1440 ? Math.round(m / 60) + ' h ago' : Math.round(m / 1440) + ' days ago'; };
+function guideText(L){
+  const e = L.epg || {};
+  if (e.state === 'building') return 'Building the guide… (large guides can take a few minutes)';
+  if (e.state === 'failed') return 'Guide failed: ' + (e.error || 'unknown error');
+  if (e.state === 'ready') return `${(e.programmes || 0).toLocaleString()} programmes for ${e.matched || 0} of ${L.channels.length} channels · updated ${ago(e.updated)}`
+    + (e.error ? ' · ' + e.error : '') + ((e.matched || 0) < L.channels.length ? ' (channels without a guide ID from your provider show without programmes)' : '');
+  return 'Not built yet';
+}
+async function showLiveSetup(){
+  let L; try { L = await api('/api/live', {}); } catch(e) { return toast(e.message); }
+  const base = location.origin, local = /^(localhost|127\.|\[::1\])/.test(location.hostname);
+  const addr = (label, url) => `<div class="addr"><code>${esc(url)}</code><button data-copy="${esc(url)}">Copy</button></div>`;
+  const m = overlay(`<div class="setup"><h2>📺 Live TV in Plex &amp; Jellyfin</h2>
+    ${L.channels.length ? `<p class="note">${L.channels.length} channels are shared. Plex and Jellyfin only see the channels you've ticked and saved.</p>`
+                        : '<p class="warn">No channels saved yet. Tick some channels and press Save channels first.</p>'}
+    ${local ? `<p class="warn">You opened this app at "${esc(location.hostname)}". Plex and Jellyfin need your NAS's network address instead, e.g. http://192.168.1.20${location.port ? ':' + esc(location.port) : ''}. Open the app that way, or swap it in below.</p>` : ''}
+    <h3>Plex <span class="note">(needs Plex Pass)</span></h3>
+    <ol><li>Plex → Settings → <b>Live TV &amp; DVR</b> → <b>Set up Plex DVR</b>.</li>
+      <li>If it doesn't find "IPTV Library" by itself, click <b>enter its network address manually</b> and type this address:</li></ol>
+    ${addr('Tuner', location.host)}
+    <ol start="3"><li>On the guide step, click <b>"Have an XMLTV guide on your server? Click here to use that instead"</b> and paste:</li></ol>
+    ${addr('Guide', base + '/live/epg.xml')}
+    <ol start="4"><li>Continue. Channels match the guide by number automatically.</li></ol>
+    <h3>Jellyfin</h3>
+    <ol><li>Dashboard → <b>Live TV</b> → Tuner Devices <b>+</b> → type <b>M3U Tuner</b>, File or URL:</li></ol>
+    ${addr('M3U', base + '/live/channels.m3u')}
+    <ol start="2"><li>TV Guide Data Providers <b>+</b> → <b>XMLTV</b>, File or URL:</li></ol>
+    ${addr('Guide', base + '/live/epg.xml')}
+    <ol start="3"><li>Save, then run <b>Refresh Guide Data</b> in Jellyfin's Scheduled Tasks.</li></ol>
+    <h3>Settings</h3>
+    <div class="row"><label style="margin:0;white-space:nowrap" for="lTun">Channels watched at once</label>
+      <select id="lTun" style="width:auto">${[1,2,3,4,5,6,8,10].map(n => `<option${n === L.tuners ? ' selected' : ''}>${n}</option>`).join('')}</select>
+      <span class="note">Keep within your IPTV plan's connection limit (downloads use connections too).</span></div>
+    <label for="lEpg" style="margin:0">Guide (XMLTV) source: leave empty to use your provider's</label>
+    <div class="row"><input id="lEpg" placeholder="${L.guide_source && !L.epg_url ? 'Using your IPTV provider\'s guide' : 'https://example.com/guide.xml'}" value="${esc(L.epg_url || '')}"><button id="lEpgSave">Save</button></div>
+    <p class="note" id="lGuide">Guide: ${esc(guideText(L))}</p>
+    <div class="actions"><button id="lRefresh">Refresh guide now</button>${L.channels.length ? '<button id="lOff">Turn off Live TV sharing</button>' : ''}</div>
+    <p class="note">These addresses don't need the app password: Plex and Jellyfin can't type one. Your IPTV login is saved on this device so they can tune channels.</p>
+  </div>`);
+  const refreshGuide = async () => { try { const d = await api('/api/live', {}); const g = m.querySelector('#lGuide'); if (!g) return;
+    g.textContent = 'Guide: ' + guideText(d); if (d.epg.state === 'building') setTimeout(refreshGuide, 3000); } catch(e) {} };
+  m.querySelector('#lTun').onchange = e => post('/api/live/settings', {tuners:+e.target.value}).then(() => toast('Saved')).catch(x => toast(x.message));
+  m.querySelector('#lEpgSave').onclick = () => post('/api/live/settings', {epg_url:m.querySelector('#lEpg').value.trim()})
+    .then(() => { toast('Guide source saved, rebuilding the guide'); setTimeout(refreshGuide, 500); }).catch(x => toast(x.message));
+  m.querySelector('#lRefresh').onclick = () => post('/api/live/epg/refresh').then(() => { toast('Rebuilding the guide…'); refreshGuide(); }).catch(x => toast(x.message));
+  const off = m.querySelector('#lOff');
+  if (off) off.onclick = async () => { if (!confirm('Stop sharing Live TV with Plex and Jellyfin? Your saved channel list will be cleared.')) return;
+    await post('/api/live/disable'); S.liveDirty = false; closeOv(); if (S.tab === 'live') { await loadLive(); applyFilter(); renderCats(); } toast('Live TV sharing turned off'); };
+  if (L.epg.state === 'building') refreshGuide();
+}
+$('#liveSetup').onclick = showLiveSetup;
 
 /* ---------- updates ---------- */
 let UPD = null;
