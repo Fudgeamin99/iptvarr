@@ -35,7 +35,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 REPO = os.environ.get("IPTV_REPO", "Fudgeamin99/iptvarr")   # GitHub repo the Update button checks
 UA = "Mozilla/5.0 (IPTV Library) VLC/3.0.20"
 # Many IPTV panels use self-signed / expired certificates.
@@ -185,6 +185,35 @@ LANG_NAME = {code: name for code, name, _, _ in LANGS}
 LANG_2 = {code: two for code, _, two, _ in LANGS}
 TEXT_SUBS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text", "tx3g"}
 TRACK_CACHE = {}
+FF_INSTALL = {"state": "idle", "error": ""}
+
+
+def ffmpeg_installer():
+    """How FFmpeg can be installed from inside the app (Docker images run as root with a package manager)."""
+    if not (hasattr(os, "geteuid") and os.geteuid() == 0):
+        return None
+    if shutil.which("apk"):
+        return [["apk", "add", "--no-cache", "ffmpeg"]]
+    if shutil.which("apt-get"):
+        return [["apt-get", "update"], ["apt-get", "install", "-y", "--no-install-recommends", "ffmpeg"]]
+    return None
+
+
+def install_ffmpeg():
+    global FFMPEG, FFPROBE
+    FF_INSTALL.update(state="installing", error="")
+    try:
+        for cmd in ffmpeg_installer() or []:
+            r = subprocess.run(cmd, capture_output=True, timeout=1200, env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"})
+            if r.returncode:
+                raise RuntimeError((r.stderr.decode("utf-8", "replace").strip().splitlines() or ["install failed"])[-1][:200])
+        FFMPEG, FFPROBE = shutil.which("ffmpeg"), shutil.which("ffprobe")
+        if not (FFMPEG and FFPROBE):
+            raise RuntimeError("FFmpeg still isn't available after installing")
+        FF_INSTALL["state"] = "done"
+        print("FFmpeg installed - audio & subtitle choices are on")
+    except Exception as e:  # noqa
+        FF_INSTALL.update(state="failed", error=str(e))
 
 
 def lang_code(tag):
@@ -413,6 +442,7 @@ class Downloader:
         keep = ("id", "title", "dest", "status", "done", "total", "speed", "error", "note")
         return {"folder": str(self.folder), "movies_folder": str(self.movies), "tv_folder": str(self.tv),
                 "workers": self.max, "can_open": CAN_OPEN, "prefs": self.prefs, "ffmpeg": bool(FFMPEG and FFPROBE),
+                "ff_install": FF_INSTALL, "ff_can_install": bool(ffmpeg_installer()),
                 "langs": [[c, n] for c, n, _, _ in LANGS],
                 "jobs": [{k: j.get(k, "") for k in keep} for j in sorted(self.jobs.values(), key=lambda j: -j["id"])]}
 
@@ -685,7 +715,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     return self.send(200, probe_tracks(q.get("url", "")))
                 except Exception as e:  # noqa
-                    return self.send(400, {"error": str(e), "no_ffmpeg": not FFPROBE})
+                    return self.send(400, {"error": str(e), "no_ffmpeg": not FFPROBE, "can_install": bool(ffmpeg_installer())})
             if u.path == "/api/version":
                 return self.send(200, {"version": VERSION})
             if u.path == "/api/update/check":
@@ -715,6 +745,13 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}")
             p = urllib.parse.urlsplit(self.path).path
+            if p == "/api/ffmpeg/install":
+                if not (FFMPEG and FFPROBE) and FF_INSTALL["state"] != "installing":
+                    if not ffmpeg_installer():
+                        return self.send(400, {"error": "FFmpeg can't be installed from the app here - install it on this computer, or use the latest docker-compose.yml"})
+                    threading.Thread(target=install_ffmpeg, daemon=True).start()
+                    FF_INSTALL["state"] = "installing"
+                return self.send(200, DL.snapshot())
             if p == "/api/update/apply":
                 return self.send(200, apply_update())
             if p == "/api/downloads/add":
@@ -989,7 +1026,8 @@ main{overflow:auto;padding:18px}
       <div class="frow"><span>Subtitles</span><select id="pSub" style="grid-column:span 2" aria-label="Preferred subtitle language"></select></div>
       <label class="chk"><input type="checkbox" id="pKeep"> Keep the other audio languages too</label>
       <label class="chk"><input type="checkbox" id="pSrt"> Also save subtitles as a separate .srt file</label>
-      <small id="ffNote" class="hidden">FFmpeg isn't installed, so audio and subtitle choices can't be applied to downloads. Use the latest docker-compose.yml from GitHub (it installs FFmpeg).</small>
+      <div id="ffNote" class="hidden"><small>FFmpeg isn't installed, so audio and subtitle choices are off and downloads keep every track as it is.</small>
+        <div class="row" style="margin-top:6px"><button id="ffInstall" class="pri">Install FFmpeg</button><small id="ffState"></small></div></div>
     </div>
     <div class="row"><button id="dlRetry">Retry failed</button><button id="dlCancel">Cancel all</button><button id="dlClear">Clear finished</button></div>
   </div>
@@ -1258,7 +1296,7 @@ async function pollDl(){
   clearTimeout(dlTimer);
   let active = false;
   try { const d = await api('/api/downloads', {}); renderDl(d); active = d.jobs.some(j => ['queued', 'downloading', 'processing'].includes(j.status));
-    PREFS = d.prefs || PREFS; FF = !!d.ffmpeg; if (d.langs) LANGS = d.langs;
+    PREFS = d.prefs || PREFS; FF = !!d.ffmpeg; FFI = d.ff_install || FFI; FF_CAN = !!d.ff_can_install; if (d.langs) LANGS = d.langs;
     if (dlOpen) fillPrefs();
     if (dlOpen) for (const [id, key] of [['#fMovies', 'movies_folder'], ['#fTv', 'tv_folder']])
       if (document.activeElement !== $(id) && !$(id).dataset.edited) $(id).value = d[key];
@@ -1347,12 +1385,31 @@ $('#expCsv').onclick = () => {
 let PREFS = {audio_lang:'eng', sub_lang:'eng', keep_audio:false, srt:true}, FF = false, LANGS = [['eng', 'English']];
 const langOpts = (sel, withOff) => (withOff ? `<option value="off"${sel === 'off' ? ' selected' : ''}>Off</option>` : '')
   + LANGS.map(([c, n]) => `<option value="${c}"${c === sel ? ' selected' : ''}>${esc(n)}</option>`).join('');
+let FFI = {state:'idle'}, FF_CAN = false;
+function ffStateText(){
+  return FFI.state === 'installing' ? 'Installing… this takes about a minute.' : FFI.state === 'failed' ? 'Install failed: ' + (FFI.error || 'unknown error')
+    : FF_CAN ? '' : 'Install FFmpeg on this computer, or use the latest docker-compose.yml from GitHub.';
+}
+async function installFF(){
+  try { const d = await post('/api/ffmpeg/install'); FFI = d.ff_install; FF = d.ffmpeg; } catch(e) { toast(e.message); return false; }
+  for (let i = 0; i < 400 && !FF && FFI.state === 'installing'; i++) {
+    await new Promise(r => setTimeout(r, 1500));
+    try { const d = await api('/api/downloads', {}); FFI = d.ff_install; FF = d.ffmpeg; } catch(e) {}
+    if (dlOpen) fillPrefs();
+  }
+  if (FF) toast('FFmpeg installed — audio & subtitle choices are on'); else if (FFI.state === 'failed') toast(ffStateText());
+  if (dlOpen) fillPrefs();
+  return FF;
+}
 function fillPrefs(){
   if (document.activeElement !== $('#pAudio')) $('#pAudio').innerHTML = langOpts(PREFS.audio_lang, false);
   if (document.activeElement !== $('#pSub')) $('#pSub').innerHTML = langOpts(PREFS.sub_lang, true);
   $('#pKeep').checked = !!PREFS.keep_audio; $('#pSrt').checked = !!PREFS.srt;
   $('#ffNote').classList.toggle('hidden', FF);
+  $('#ffInstall').classList.toggle('hidden', !FF_CAN || FFI.state === 'installing');
+  $('#ffState').textContent = ffStateText();
 }
+$('#ffInstall').onclick = installFF;
 const savePrefs = async () => {
   try { const d = await post('/api/settings', {prefs:{audio_lang:$('#pAudio').value, sub_lang:$('#pSub').value, keep_audio:$('#pKeep').checked, srt:$('#pSrt').checked}});
         PREFS = d.prefs; toast('Audio & subtitle defaults saved'); } catch(e) { toast(e.message); }
@@ -1384,10 +1441,27 @@ async function openTracks(k){
     <p class="note">Checking which audio and subtitle tracks this file has…</p></div></div>`;
   o.classList.remove('hidden');
   let tr;
-  try { tr = await api('/api/tracks', {url:it.url}); }
-  catch(e) { o.querySelector('.tk').innerHTML = `<h2>${esc(it.title)}</h2><p class="note">${esc(e.message)}</p>
-      <p class="note">Downloads will still use your default languages from the Downloads panel where the file allows.</p>
-      <div class="actions"><button data-tclose>Close</button></div>`; return; }
+  try {
+    const r = await fetch('/api/tracks?' + new URLSearchParams({url:it.url})); tr = await r.json();
+    if (!r.ok) throw Object.assign(new Error(tr.error || 'Error ' + r.status), tr);
+  } catch(e) {
+    const box = o.querySelector('.tk');
+    if (e.no_ffmpeg) {
+      FF_CAN = !!e.can_install;
+      box.innerHTML = `<h2>${esc(it.title)}</h2>
+        <p>Audio and subtitle choices need <b>FFmpeg</b>, which isn't installed yet.</p>
+        <p class="note">Until it is, downloads keep every audio track and subtitle exactly as they are in the file.</p>
+        ${FF_CAN ? '<p class="note">The app can install it for you, which takes about a minute. If the container is ever re-created, it\'s needed again, unless you use the latest docker-compose.yml from GitHub, which installs it automatically.</p>'
+                 : '<p class="note">Install FFmpeg on this computer, or switch to the latest docker-compose.yml from GitHub, which installs it.</p>'}
+        <div class="actions">${FF_CAN ? '<button class="pri" id="tFF">Install FFmpeg</button>' : ''}<button data-tclose>Close</button></div>`;
+      const b = box.querySelector('#tFF');
+      if (b) b.onclick = async () => { b.disabled = true; b.textContent = 'Installing FFmpeg… (about a minute)';
+        if (await installFF()) openTracks(k); else { b.disabled = false; b.textContent = 'Try again'; box.querySelector('.note').textContent = ffStateText(); } };
+    } else box.innerHTML = `<h2>${esc(it.title)}</h2><p class="note">${esc(e.message)}</p>
+        <p class="note">Downloads will use your default languages from the Downloads panel if the file has them.</p>
+        <div class="actions"><button data-tclose>Close</button></div>`;
+    return;
+  }
   const a0 = Number.isInteger(it.audio) ? tr.audio.find(a => a.index === it.audio) : prefA(tr.audio);
   const s0 = it.subs === 'none' ? null : Number.isInteger(it.subs) ? tr.subs.find(x => x.index === it.subs) : prefS(tr.subs);
   o.querySelector('.tk').innerHTML = `<h2>${esc(it.title)}</h2>
