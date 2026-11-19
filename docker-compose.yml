@@ -1,0 +1,43 @@
+# IPTV Library - Docker Compose (UGREEN NAS, Synology, Unraid, any Docker host)
+# https://github.com/Fudgeamin99/iptvarr
+#
+# On first start the app downloads itself from the latest GitHub release into ./app.
+# After that, use the "Update" button inside the app to get new versions.
+#
+# Open  http://<your-NAS-IP>:8765  from any phone, PC or TV browser on your network.
+
+services:
+  iptv-library:
+    image: python:3.12-alpine          # official Python image - nothing to build
+    container_name: iptv-library
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ ! -f /app/iptv_library.py ]; then
+          echo "Downloading IPTV Library from GitHub..."
+          python -c "import urllib.request as u; u.urlretrieve('https://github.com/Fudgeamin99/iptvarr/releases/latest/download/iptv_library.py', '/app/iptv_library.py')"
+        fi
+        exec python /app/iptv_library.py --host 0.0.0.0 --port 8765 --no-browser
+    ports:
+      - "8765:8765"                    # change the LEFT number if 8765 is already used on your NAS
+    environment:
+      PYTHONUNBUFFERED: "1"
+      IPTV_DOWNLOADS: /downloads
+      IPTV_CONFIG_DIR: /config
+      IPTV_UMASK: "000"                # downloaded files can be moved/deleted by any NAS user over SMB
+      # Recommended - otherwise anyone on your Wi-Fi can open the app.
+      # Your browser asks for this username + password once.
+      IPTV_APP_USER: iptv
+      IPTV_APP_PASSWORD: ""            # e.g. "pick-a-password"; leave "" for no password
+    volumes:
+      - ./app:/app                     # the app itself (must be writable so the Update button works)
+      - ./config:/config               # settings + download queue
+      # >>> Where movies & shows are saved: change the LEFT side to a shared folder on your NAS <<<
+      - /volume1/Media/IPTV:/downloads
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8765), 3)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

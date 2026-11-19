@@ -1,0 +1,32 @@
+name: Release
+
+# Bump VERSION in iptv_library.py, then push a tag like v1.2.0 (or create a release on github.com).
+# This attaches the files that docker-compose.yml and the app's Update button download.
+on:
+  push:
+    tags: ["v*"]
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the app is valid and VERSION matches the tag
+        run: |
+          python3 -m py_compile iptv_library.py
+          V=$(python3 -c "import re;print(re.search(r'^VERSION = \"(.+?)\"', open('iptv_library.py').read(), re.M).group(1))")
+          if [ "v$V" != "$GITHUB_REF_NAME" ]; then echo "::error::VERSION in iptv_library.py is $V but the tag is $GITHUB_REF_NAME"; exit 1; fi
+
+      - name: Publish release files
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            iptv_library.py
+            docker-compose.yml
