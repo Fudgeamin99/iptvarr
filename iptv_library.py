@@ -35,7 +35,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 REPO = os.environ.get("IPTV_REPO", "Fudgeamin99/iptvarr")   # GitHub repo the Update button checks
 UA = "Mozilla/5.0 (IPTV Library) VLC/3.0.20"
 # Many IPTV panels use self-signed / expired certificates.
@@ -119,6 +119,9 @@ SETTINGS_FILE = Path(CONFIG_DIR) / "settings.json" if CONFIG_DIR else Path.home(
 JOBS_FILE = Path(CONFIG_DIR) / "downloads.json" if CONFIG_DIR else Path.home() / ".iptv_library_downloads.json"
 APP_USER = os.environ.get("IPTV_APP_USER", "iptv")
 APP_PASSWORD = os.environ.get("IPTV_APP_PASSWORD", "")
+# Folder picker limit: on Docker this is /downloads so the picker can't wander round the container.
+BROWSE_ROOT = Path(os.environ["IPTV_BROWSE_ROOT"]).resolve() if os.environ.get("IPTV_BROWSE_ROOT") else None
+JUNK_DIRS = ("@eaDir", "#recycle", "#snapshot", "@Recycle", "$RECYCLE.BIN", "System Volume Information", "lost+found")
 CAN_OPEN = sys.platform.startswith("win") or sys.platform == "darwin" or bool(shutil.which("xdg-open"))
 BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
@@ -155,12 +158,45 @@ class Cancelled(Exception):
     pass
 
 
+def allowed_path(f, base=None):
+    """Turn what the user typed/picked into an absolute folder, kept inside BROWSE_ROOT if one is set."""
+    p = Path(str(f or "").strip() or (base or ".")).expanduser()
+    if not p.is_absolute():
+        p = Path(base or BROWSE_ROOT or Path.home()) / p
+    p = p.resolve()
+    if BROWSE_ROOT and p != BROWSE_ROOT and BROWSE_ROOT not in p.parents:
+        raise ValueError(f"Choose a folder inside {BROWSE_ROOT} (that's your NAS download share)")
+    return p
+
+
+def list_folders(path, base):
+    p = allowed_path(path, base)
+    while not p.is_dir() and p != p.parent and (not BROWSE_ROOT or p != BROWSE_ROOT):
+        p = p.parent                                   # folder not created yet - show the nearest existing one
+    dirs = []
+    try:
+        with os.scandir(p) as it:
+            for e in it:
+                try:
+                    if e.is_dir() and not e.name.startswith(".") and e.name not in JUNK_DIRS:
+                        dirs.append(e.name)
+                except OSError:
+                    pass
+    except OSError as e:
+        raise ValueError(f"Can't open {p}: {e.strerror}")
+    at_top = p == p.parent or (BROWSE_ROOT is not None and p == BROWSE_ROOT)
+    return {"path": str(p), "parent": None if at_top else str(p.parent), "root": str(BROWSE_ROOT or ""),
+            "dirs": sorted(dirs, key=str.lower)[:1000]}
+
+
 class Downloader:
-    def __init__(self, folder, workers):
+    def __init__(self, folder, workers, movies=None, tv=None):
         self.lock = threading.Lock()
         self.jobs, self.seq, self.threads, self.max = {}, 0, 0, 1
         self.q = queue.Queue()
         self.folder = Path(folder).expanduser()
+        self.movies = Path(movies).expanduser() if movies else self.folder / "Movies"
+        self.tv = Path(tv).expanduser() if tv else self.folder / "TV Shows"
         self.set_workers(workers)
 
     # settings
@@ -171,12 +207,20 @@ class Downloader:
             self.threads += 1
 
     def set_folder(self, f):
-        p = Path(str(f).strip()).expanduser()
+        p = allowed_path(f, self.folder)
         p.mkdir(parents=True, exist_ok=True)
         self.folder = p
 
+    def set_kind_folder(self, kind, f):
+        p = allowed_path(f, self.folder)
+        p.mkdir(parents=True, exist_ok=True)
+        if kind == "movie":
+            self.movies = p
+        else:
+            self.tv = p
+
     def save(self):
-        save_settings({"folder": str(self.folder), "workers": self.max})
+        save_settings({"folder": str(self.folder), "movies": str(self.movies), "tv": str(self.tv), "workers": self.max})
 
     # the queue is saved so restarts and updates don't lose downloads (they resume from .part files)
     def persist(self):
@@ -215,7 +259,9 @@ class Downloader:
                 if not url.startswith(("http://", "https://")) or not segs:
                     skipped += 1
                     continue
-                dest = str(self.folder.joinpath(*segs))
+                kind = it.get("kind")
+                base = self.movies if kind == "movie" else self.tv if kind == "tv" else self.folder
+                dest = str(base.joinpath(*segs))
                 if dest in busy:
                     skipped += 1
                     continue
@@ -255,7 +301,8 @@ class Downloader:
 
     def snapshot(self):
         keep = ("id", "title", "dest", "status", "done", "total", "speed", "error")
-        return {"folder": str(self.folder), "workers": self.max, "can_open": CAN_OPEN,
+        return {"folder": str(self.folder), "movies_folder": str(self.movies), "tv_folder": str(self.tv),
+                "workers": self.max, "can_open": CAN_OPEN,
                 "jobs": [{k: j[k] for k in keep} for j in sorted(self.jobs.values(), key=lambda j: -j["id"])]}
 
     # workers
@@ -468,6 +515,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, M3U_CACHE[url])
             if u.path == "/api/downloads":
                 return self.send(200, DL.snapshot())
+            if u.path == "/api/folders":
+                try:
+                    return self.send(200, list_folders(q.get("path"), DL.folder))
+                except ValueError as e:
+                    return self.send(400, {"error": str(e)})
             if u.path == "/api/version":
                 return self.send(200, {"version": VERSION})
             if u.path == "/api/update/check":
@@ -507,9 +559,18 @@ class Handler(BaseHTTPRequestHandler):
                 DL.retry(body.get("id", "all"))
             elif p == "/api/downloads/clear":
                 DL.clear()
+            elif p == "/api/folders/create":
+                parent = allowed_path(body.get("path"), DL.folder)
+                new = allowed_path(clean_segment(body.get("name") or "New folder"), parent)
+                new.mkdir(parents=True, exist_ok=True)
+                return self.send(200, list_folders(str(new), DL.folder))
             elif p == "/api/settings":
                 if body.get("folder"):
                     DL.set_folder(body["folder"])
+                if body.get("movies_folder"):
+                    DL.set_kind_folder("movie", body["movies_folder"])
+                if body.get("tv_folder"):
+                    DL.set_kind_folder("tv", body["tv_folder"])
                 if body.get("workers"):
                     DL.set_workers(body["workers"])
                 DL.save()
@@ -535,8 +596,10 @@ def main():
     st = load_settings()
     folder = (a.downloads or st.get("folder") or os.environ.get("IPTV_DOWNLOADS")
               or str(Path.home() / "Downloads" / "IPTV Library"))
-    DL = Downloader(folder, st.get("workers", 1))
-    print(f"IPTV Library v{VERSION}  -  downloads folder: {DL.folder}")
+    DL = Downloader(folder, st.get("workers", 1),
+                    movies=st.get("movies") or os.environ.get("IPTV_MOVIES_DIR"),
+                    tv=st.get("tv") or os.environ.get("IPTV_TV_DIR"))
+    print(f"IPTV Library v{VERSION}  -  movies: {DL.movies}  -  TV shows: {DL.tv}")
     srv = None
     if os.environ.pop("IPTV_RESTART", None):       # restarting after an update: wait for the old copy to let go
         for _ in range(40):
@@ -669,6 +732,15 @@ main{overflow:auto;padding:18px}
 .upd{padding:26px;display:flex;flex-direction:column;gap:14px}.upd h2{margin:0}
 .upd pre{white-space:pre-wrap;font:inherit;color:#c9ccd4;background:var(--panel2);border-radius:9px;padding:12px 14px;margin:0;max-height:300px;overflow:auto}
 .upd .note{color:var(--mute)}.upd .warn{color:var(--acc2)}
+#dl .frow{display:grid;grid-template-columns:78px 1fr auto;gap:8px;align-items:center}
+#dl .frow span{color:var(--mute);font-size:13px}
+#picker{border:1px solid var(--line);border-radius:10px;background:var(--bg);padding:10px;display:flex;flex-direction:column;gap:8px}
+#picker .ph{display:flex;align-items:center;gap:8px;font-weight:600}
+#pkPath{font-size:12px;color:var(--mute);word-break:break-all}
+#pkList{max-height:240px;overflow:auto;display:flex;flex-direction:column;gap:2px}
+#pkList button{text-align:left;border:0;background:none;padding:8px 10px;border-radius:7px}
+#pkList button:hover{background:var(--panel2)}
+#pkList .empty{padding:14px;font-size:13px}
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--acc);color:#1a1205;padding:9px 16px;border-radius:8px;font-weight:600;z-index:20}
 @media (max-width:760px){#app{grid-template-columns:1fr}aside{display:none}header{flex-wrap:wrap}.mbody{flex-direction:column;margin-top:-60px}.mbody h2{margin-top:0}}
 </style></head><body>
@@ -720,8 +792,17 @@ main{overflow:auto;padding:18px}
 <div id="dl" class="hidden">
   <div class="dh">
     <h3>Downloads <button id="dlClose" aria-label="Close">✕</button></h3>
-    <label style="margin:0">Save to folder</label>
-    <div class="row"><input id="dlFolder"><button id="dlSave">Save</button><button id="dlOpen">Open</button></div>
+    <label style="margin:0">Save downloads to</label>
+    <div class="frow"><span>Movies</span><input id="fMovies" aria-label="Movies folder"><button data-browse="movie">Browse…</button></div>
+    <div class="frow"><span>TV Shows</span><input id="fTv" aria-label="TV Shows folder"><button data-browse="tv">Browse…</button></div>
+    <div class="row"><button id="dlSave" class="pri">Save folders</button><button id="dlOpen">Open downloads</button></div>
+    <div id="picker" class="hidden">
+      <div class="ph"><button id="pkUp" aria-label="Up one folder">↑</button><span id="pkTitle">Choose folder</span></div>
+      <div id="pkPath"></div>
+      <div id="pkList"></div>
+      <div class="row"><input id="pkNew" placeholder="New folder name"><button id="pkMake">Create</button></div>
+      <div class="row"><button id="pkUse" class="pri">Use this folder</button><button id="pkCancel">Cancel</button></div>
+    </div>
     <div class="row"><label style="margin:0;white-space:nowrap">At the same time</label>
       <select id="dlWorkers" style="width:auto"><option>1</option><option>2</option><option>3</option><option>4</option></select>
       <small>Keep within your account's connection limit</small></div>
@@ -864,11 +945,11 @@ const DLREG = new Map(); let dlSeq = 0;
 const regDl = items => { const k = 'd' + (++dlSeq); DLREG.set(k, items); return k; };
 const extOf = (url, fb) => ((String(url).split('?')[0].match(/\.([a-z0-9]{2,5})$/i) || [])[1] || fb || 'mp4').toLowerCase();
 const pad2 = n => String(n).padStart(2, '0');
-const movieDl = (title, year, url, ext) => ({url, title, path:['Movies', `${title}${year && !String(title).includes(year) ? ` (${year})` : ''}.${extOf(url, ext)}`]});
+const movieDl = (title, year, url, ext) => ({url, title, kind:'movie', path:[`${title}${year && !String(title).includes(year) ? ` (${year})` : ''}.${extOf(url, ext)}`]});
 function epDl(show, season, e){
   const tag = `S${pad2(season)}E${pad2(e.num)}`;
   const name = `${show} ${tag}` + (e.title && !/S\d+\s*E\d+/i.test(e.title) && !/^Episode \d+$/i.test(e.title) ? ` - ${e.title}` : '');
-  return {url:e.url, title:`${show} ${tag}`, path:['TV Shows', show, `Season ${pad2(season)}`, `${name}.${extOf(e.url, e.ext)}`]};
+  return {url:e.url, title:`${show} ${tag}`, kind:'tv', path:[show, `Season ${pad2(season)}`, `${name}.${extOf(e.url, e.ext)}`]};
 }
 const actBtns = (url, title, dlk) => `<button class="pri" data-play="${esc(url)}" data-title="${esc(title)}" data-dlk="${dlk || ''}">▶ Play</button>
   ${dlk ? `<button data-dl="${dlk}">⬇ Download</button>` : ''}
@@ -987,15 +1068,49 @@ async function pollDl(){
   clearTimeout(dlTimer);
   let active = false;
   try { const d = await api('/api/downloads', {}); renderDl(d); active = d.jobs.some(j => j.status === 'queued' || j.status === 'downloading');
-    if (dlOpen && document.activeElement !== $('#dlFolder') && !$('#dlFolder').dataset.edited) $('#dlFolder').value = d.folder;
+    if (dlOpen) for (const [id, key] of [['#fMovies', 'movies_folder'], ['#fTv', 'tv_folder']])
+      if (document.activeElement !== $(id) && !$(id).dataset.edited) $(id).value = d[key];
     if (dlOpen) { $('#dlWorkers').value = String(d.workers); $('#dlOpen').classList.toggle('hidden', !d.can_open); }
   } catch(e) {}
   dlTimer = setTimeout(pollDl, active || dlOpen ? 1000 : 5000);
 }
-$('#dlBtn').onclick = () => { dlOpen = true; $('#dlFolder').dataset.edited = ''; $('#dl').classList.remove('hidden'); pollDl(); };
+$('#dlBtn').onclick = () => { dlOpen = true; $('#fMovies').dataset.edited = $('#fTv').dataset.edited = ''; $('#picker').classList.add('hidden'); $('#dl').classList.remove('hidden'); pollDl(); };
 $('#dlClose').onclick = () => { dlOpen = false; $('#dl').classList.add('hidden'); };
-$('#dlFolder').oninput = () => $('#dlFolder').dataset.edited = '1';
-$('#dlSave').onclick = async () => { try { await post('/api/settings', {folder:$('#dlFolder').value}); $('#dlFolder').dataset.edited = ''; toast('Download folder saved'); pollDl(); } catch(e) { toast(e.message); } };
+$('#fMovies').oninput = () => $('#fMovies').dataset.edited = '1';
+$('#fTv').oninput = () => $('#fTv').dataset.edited = '1';
+$('#dlSave').onclick = async () => {
+  try { await post('/api/settings', {movies_folder:$('#fMovies').value, tv_folder:$('#fTv').value});
+        $('#fMovies').dataset.edited = $('#fTv').dataset.edited = ''; toast('Download folders saved'); pollDl(); }
+  catch(e) { toast(e.message); }
+};
+/* folder picker */
+const PK = {kind:null, path:''};
+async function pkLoad(path, create){
+  try {
+    const d = create ? await post('/api/folders/create', {path:PK.path, name:create}) : await api('/api/folders', path ? {path} : {});
+    PK.path = d.path; PK.parent = d.parent;
+    $('#pkPath').textContent = d.path; $('#pkUp').disabled = !d.parent;
+    $('#pkList').innerHTML = d.dirs.length ? d.dirs.map(n => `<button data-dir="${esc(n)}">📁 ${esc(n)}</button>`).join('')
+      : '<div class="empty">No folders here. Use this one, or create a new folder below.</div>';
+  } catch(e) { toast(e.message); }
+}
+document.querySelectorAll('[data-browse]').forEach(b => b.onclick = () => {
+  PK.kind = b.dataset.browse; $('#pkTitle').textContent = 'Choose the ' + (PK.kind === 'movie' ? 'Movies' : 'TV Shows') + ' folder';
+  $('#picker').classList.remove('hidden'); $('#pkNew').value = '';
+  pkLoad((PK.kind === 'movie' ? $('#fMovies') : $('#fTv')).value);
+});
+$('#pkList').onclick = e => { const b = e.target.closest('[data-dir]'); if (b) pkLoad(PK.path.replace(/[\\/]+$/, '') + (PK.path.includes('\\') && !PK.path.includes('/') ? '\\' : '/') + b.dataset.dir); };
+$('#pkUp').onclick = () => PK.parent && pkLoad(PK.parent);
+$('#pkMake').onclick = () => { const n = $('#pkNew').value.trim(); if (n) { $('#pkNew').value = ''; pkLoad(null, n); } };
+$('#pkNew').onkeydown = e => { if (e.key === 'Enter') $('#pkMake').click(); };
+$('#pkCancel').onclick = () => $('#picker').classList.add('hidden');
+$('#pkUse').onclick = async () => {
+  const input = PK.kind === 'movie' ? $('#fMovies') : $('#fTv');
+  input.value = PK.path; $('#picker').classList.add('hidden');
+  try { await post('/api/settings', PK.kind === 'movie' ? {movies_folder:PK.path} : {tv_folder:PK.path});
+        input.dataset.edited = ''; toast((PK.kind === 'movie' ? 'Movies' : 'TV Shows') + ' will save to ' + PK.path); pollDl(); }
+  catch(e) { toast(e.message); }
+};
 $('#dlWorkers').onchange = () => post('/api/settings', {workers:+$('#dlWorkers').value}).then(pollDl);
 $('#dlOpen').onclick = () => post('/api/open-folder').catch(e => toast(e.message));
 $('#dlRetry').onclick = () => post('/api/downloads/retry', {id:'all'}).then(pollDl);

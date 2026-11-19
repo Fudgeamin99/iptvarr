@@ -9,7 +9,8 @@ It runs in Docker on UGREEN, Synology, Unraid or any other Docker host, and you 
 - **Movies & TV Shows** with posters, categories, search, sort, plots, cast and ratings
 - **Play** in the browser, or open any title in VLC
 - **Download** movies, single episodes, whole seasons or entire shows straight to your NAS, saved as
-  `Movies/Title (Year).mkv` and `TV Shows/Show/Season 01/Show S01E01 - Title.mp4`
+  `Title (Year).mkv` and `Show/Season 01/Show S01E01 - Title.mp4`
+  - choose **separate folders for Movies and TV Shows** with a built-in folder browser
   - progress, speed and time left, and downloads resume after a dropped connection or a restart
 - **Export** any list as an `.m3u` playlist or a `.csv` spreadsheet
 - **One-click updates** from this repo's releases
@@ -21,12 +22,12 @@ It runs in Docker on UGREEN, Synology, Unraid or any other Docker host, and you 
 
 1. Make a folder for it on your NAS, e.g. `/volume1/docker/iptvarr`.
 2. Save the compose file below as `docker-compose.yml` in that folder, then change two things:
-   - `/volume1/Media/IPTV` → the shared folder you want downloads saved to (it must already exist)
+   - `/volume1/Media` → the shared folder your downloads go in (it must already exist)
    - `IPTV_APP_PASSWORD` → pick a password, or anyone on your network can use the app
 3. Start it:
    - **UGREEN:** Docker app → **Project** → **Create** → choose that folder → paste the compose file → **Deploy**
    - **Anywhere else:** `docker compose up -d`
-4. Open `http://<your-NAS-IP>:8765`.
+4. Open `http://<your-NAS-IP>:8765`, then click **⬇ Downloads → Browse…** to pick where Movies and TV Shows are saved.
 
 ```yaml
 # IPTV Library - Docker Compose (UGREEN NAS, Synology, Unraid, any Docker host)
@@ -55,6 +56,7 @@ services:
     environment:
       PYTHONUNBUFFERED: "1"
       IPTV_DOWNLOADS: /downloads
+      IPTV_BROWSE_ROOT: /downloads     # the in-app folder picker stays inside your download share(s)
       IPTV_CONFIG_DIR: /config
       IPTV_UMASK: "000"                # downloaded files can be moved/deleted by any NAS user over SMB
       # Recommended - otherwise anyone on your Wi-Fi can open the app.
@@ -65,7 +67,11 @@ services:
       - ./app:/app                     # the app itself (must be writable so the Update button works)
       - ./config:/config               # settings + download queue
       # >>> Where movies & shows are saved: change the LEFT side to a shared folder on your NAS <<<
-      - /volume1/Media/IPTV:/downloads
+      # Pick the exact Movies and TV Shows folders inside it from the app (Downloads > Browse...).
+      - /volume1/Media:/downloads
+      # Movies and TV in separate shares? Use these two lines instead of the one above:
+      # - /volume1/Movies:/downloads/Movies
+      # - /volume1/TV:/downloads/TV
     healthcheck:
       test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8765), 3)"]
       interval: 60s
@@ -81,7 +87,9 @@ The same file is also in the repo as [`docker-compose.yml`](docker-compose.yml) 
 
 | Environment variable | What it does |
 |---|---|
-| `IPTV_DOWNLOADS` | Download folder inside the container (keep it as `/downloads` and change the volume instead) |
+| `IPTV_DOWNLOADS` | Download share inside the container (keep it as `/downloads` and change the volume instead) |
+| `IPTV_MOVIES_DIR` / `IPTV_TV_DIR` | Optional starting folders for Movies and TV Shows (default `/downloads/Movies` and `/downloads/TV Shows`; you can change them in the app) |
+| `IPTV_BROWSE_ROOT` | Keeps the in-app folder picker inside this folder |
 | `IPTV_CONFIG_DIR` | Where settings and the download queue are saved |
 | `IPTV_APP_PASSWORD` / `IPTV_APP_USER` | Password-protect the app (user defaults to `iptv`) |
 | `IPTV_UMASK` | Permission mask for downloaded files (`000` lets every NAS user move/delete them) |

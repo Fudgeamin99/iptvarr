@@ -24,6 +24,7 @@ services:
     environment:
       PYTHONUNBUFFERED: "1"
       IPTV_DOWNLOADS: /downloads
+      IPTV_BROWSE_ROOT: /downloads     # the in-app folder picker stays inside your download share(s)
       IPTV_CONFIG_DIR: /config
       IPTV_UMASK: "000"                # downloaded files can be moved/deleted by any NAS user over SMB
       # Recommended - otherwise anyone on your Wi-Fi can open the app.
@@ -34,7 +35,11 @@ services:
       - ./app:/app                     # the app itself (must be writable so the Update button works)
       - ./config:/config               # settings + download queue
       # >>> Where movies & shows are saved: change the LEFT side to a shared folder on your NAS <<<
-      - /volume1/Media/IPTV:/downloads
+      # Pick the exact Movies and TV Shows folders inside it from the app (Downloads > Browse...).
+      - /volume1/Media:/downloads
+      # Movies and TV in separate shares? Use these two lines instead of the one above:
+      # - /volume1/Movies:/downloads/Movies
+      # - /volume1/TV:/downloads/TV
     healthcheck:
       test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8765), 3)"]
       interval: 60s
