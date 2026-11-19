@@ -20,15 +20,62 @@ It runs in Docker on UGREEN, Synology, Unraid or any other Docker host, and you 
 ## Install with Docker Compose
 
 1. Make a folder for it on your NAS, e.g. `/volume1/docker/iptvarr`.
-2. Download [`docker-compose.yml`](docker-compose.yml) into it and edit two things:
+2. Save the compose file below as `docker-compose.yml` in that folder, then change two things:
    - `/volume1/Media/IPTV` → the shared folder you want downloads saved to (it must already exist)
    - `IPTV_APP_PASSWORD` → pick a password, or anyone on your network can use the app
 3. Start it:
-   - **UGREEN:** Docker app → **Project** → **Create** → choose that folder → paste or upload the compose file → **Deploy**
+   - **UGREEN:** Docker app → **Project** → **Create** → choose that folder → paste the compose file → **Deploy**
    - **Anywhere else:** `docker compose up -d`
 4. Open `http://<your-NAS-IP>:8765`.
 
+```yaml
+# IPTV Library - Docker Compose (UGREEN NAS, Synology, Unraid, any Docker host)
+# https://github.com/Fudgeamin99/iptvarr
+#
+# On first start the app downloads itself from the latest GitHub release into ./app.
+# After that, use the "Update" button inside the app to get new versions.
+#
+# Open  http://<your-NAS-IP>:8765  from any phone, PC or TV browser on your network.
+
+services:
+  iptv-library:
+    image: python:3.12-alpine          # official Python image - nothing to build
+    container_name: iptv-library
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ ! -f /app/iptv_library.py ]; then
+          echo "Downloading IPTV Library from GitHub..."
+          python -c "import urllib.request as u; u.urlretrieve('https://github.com/Fudgeamin99/iptvarr/releases/latest/download/iptv_library.py', '/app/iptv_library.py')"
+        fi
+        exec python /app/iptv_library.py --host 0.0.0.0 --port 8765 --no-browser
+    ports:
+      - "8765:8765"                    # change the LEFT number if 8765 is already used on your NAS
+    environment:
+      PYTHONUNBUFFERED: "1"
+      IPTV_DOWNLOADS: /downloads
+      IPTV_CONFIG_DIR: /config
+      IPTV_UMASK: "000"                # downloaded files can be moved/deleted by any NAS user over SMB
+      # Recommended - otherwise anyone on your Wi-Fi can open the app.
+      # Your browser asks for this username + password once.
+      IPTV_APP_USER: iptv
+      IPTV_APP_PASSWORD: ""            # e.g. "pick-a-password"; leave "" for no password
+    volumes:
+      - ./app:/app                     # the app itself (must be writable so the Update button works)
+      - ./config:/config               # settings + download queue
+      # >>> Where movies & shows are saved: change the LEFT side to a shared folder on your NAS <<<
+      - /volume1/Media/IPTV:/downloads
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8765), 3)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+```
+
 On first start the container downloads the app from the latest release into `./app`. You don't need to build an image.
+The same file is also in the repo as [`docker-compose.yml`](docker-compose.yml) and attached to every release.
 
 ### Settings
 
