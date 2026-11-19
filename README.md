@@ -9,8 +9,8 @@ It runs in Docker on UGREEN, Synology, Unraid or any other Docker host, and you 
 - **Movies & TV Shows** with posters, categories, search, sort, plots, cast and ratings
 - **Play** in the browser, choosing the **audio language and subtitles** while you watch, or open any title in VLC
 - **Live TV for Plex & Jellyfin:** tick the channels you want and they appear in Plex or Jellyfin with a full **TV guide (EPG)**
-- **Download** movies, single episodes, whole seasons or entire shows straight to your NAS, saved as
-  `Title (Year).mkv` and `Show/Season 01/Show S01E01 - Title.mp4`
+- **Download** movies, single episodes, whole seasons or entire shows straight to your NAS, laid out the way
+  **Plex and Jellyfin** expect, with **posters, backgrounds, season posters, episode thumbnails and .nfo info files**
   - choose **separate folders for Movies and TV Shows** with a built-in folder browser
 - **Audio & subtitles:** when a movie or episode has more than one language or audio type, Download asks which to keep (English is pre-selected).
   The download keeps just your choice (no re-encoding, so there's no quality loss), with an optional `.srt` file that Plex and Jellyfin pick up.
@@ -122,6 +122,29 @@ video only plays in browsers that support it; use **Open in VLC** otherwise.
 What you can pick depends on your provider: many IPTV files only have one audio track and no subtitles. Downloads are copied with
 FFmpeg (not re-encoded), and if anything goes wrong the original file is kept. Picture-based subtitles (PGS/DVD) can be kept inside
 `.mkv` downloads but can't be shown in the browser or turned into `.srt`.
+
+## Downloads in Plex & Jellyfin
+
+Point a Plex/Jellyfin **Movies** library at your Movies folder and a **TV Shows** library at your TV Shows folder. Each download is saved as:
+
+```
+Movies/Heat (1995) {tmdb-949}/
+    Heat (1995).mkv          Heat (1995).nfo          Heat (1995).en.srt
+    poster.jpg               background.jpg
+TV Shows/Aggretsuko (2018) {tmdb-79581}/
+    poster.jpg   background.jpg   tvshow.nfo   season01-poster.jpg
+    Season 01/
+        Season01.jpg
+        Aggretsuko (2018) - S01E01 - Jumping into Society.mkv   (+ .nfo, .jpg, -thumb.jpg, .en.srt)
+```
+
+- **Names are cleaned up** so they match online: IPTV tags like `NF - `, `|EN|`, `[4K]`, `MULTI` and `HEVC` are removed and the year is kept.
+- The **`{tmdb-…}` ID** in the folder name (when your provider has one) makes Plex match the exact film or show.
+- **Artwork** comes from your provider (in higher resolution when it's a TMDB image) and is named for both apps:
+  `poster`/`background` for both, `SeasonXX.jpg` for Plex and `seasonXX-poster.jpg` for Jellyfin, `<episode>.jpg` for Plex and `<episode>-thumb.jpg` for Jellyfin.
+- **.nfo files** (title, year, plot, genres, cast, runtime, TMDB ID) are read by Jellyfin automatically, and by Plex's NFO agent if you use it.
+- In Plex, keep **Use local assets** turned on in the library's advanced settings (it's on by default).
+- Existing files are never overwritten. Turn the extras off under **⬇ Downloads → Save posters, artwork & info files**.
 
 ## Live TV in Plex & Jellyfin
 

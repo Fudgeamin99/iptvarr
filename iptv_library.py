@@ -39,7 +39,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 REPO = os.environ.get("IPTV_REPO", "Fudgeamin99/iptvarr")   # GitHub repo the Update button checks
 UA = "Mozilla/5.0 (IPTV Library) VLC/3.0.20"
 # Many IPTV panels use self-signed / expired certificates.
@@ -349,7 +349,110 @@ def play_command(sess):
     return cmd
 
 
-DEFAULT_PREFS = {"audio_lang": "eng", "sub_lang": "eng", "keep_audio": False, "srt": True}
+DEFAULT_PREFS = {"audio_lang": "eng", "sub_lang": "eng", "keep_audio": False, "srt": True, "artwork": True}
+
+
+# ---- artwork & .nfo files so Plex / Jellyfin show the right posters and info
+def better_image(url):
+    """TMDB links often point at small sizes - ask for a sharper one."""
+    return re.sub(r"(image\.tmdb\.org/t/p/)[^/]+/", r"\1w1280/", url) if url else url
+
+
+def save_image(url, base, also=None):
+    """Save an image next to the media as base.jpg/.png (skipped if one is already there)."""
+    if not url or not str(url).startswith(("http://", "https://")):
+        return
+    if any(base.with_name(base.name + e).exists() for e in (".jpg", ".jpeg", ".png", ".webp")):
+        return
+    try:
+        data = fetch(better_image(url), timeout=30)
+    except Exception:
+        try:
+            data = fetch(url, timeout=30)
+        except Exception:
+            return
+    ext = ".jpg" if data[:3] == b"\xff\xd8\xff" else ".png" if data[:8] == b"\x89PNG\r\n\x1a\n" else \
+          ".webp" if data[:4] == b"RIFF" and data[8:12] == b"WEBP" else None
+    if not ext or len(data) < 1000:
+        return
+    for b in [base] + list(also or []):
+        try:
+            b.with_name(b.name + ext).write_bytes(data)
+        except OSError:
+            pass
+
+
+def split_list(v, limit=20):
+    if isinstance(v, list):
+        items = v
+    else:
+        items = re.split(r"\s*[,/|]\s*", str(v or ""))
+    return [x.strip() for x in items if x and x.strip()][:limit]
+
+
+def write_nfo(path, root_tag, fields, actors=(), tmdb=None):
+    if path.exists():
+        return
+    root = ET.Element(root_tag)
+    for tag, val in fields:
+        if val in (None, "", [], 0):
+            continue
+        for v in (val if isinstance(val, list) else [val]):
+            ET.SubElement(root, tag).text = str(v)
+    if tmdb:
+        u = ET.SubElement(root, "uniqueid", {"type": "tmdb", "default": "true"})
+        u.text = str(tmdb)
+        ET.SubElement(root, "tmdbid").text = str(tmdb)
+    for name in actors:
+        a = ET.SubElement(root, "actor")
+        ET.SubElement(a, "name").text = name
+    try:
+        ET.indent(root)                                 # Python 3.9+
+    except AttributeError:
+        pass
+    path.write_bytes(b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(root, encoding="utf-8"))
+
+
+def minutes(m):
+    try:
+        if m.get("secs"):
+            return round(int(m["secs"]) / 60)
+        h, mi, *_ = (str(m.get("duration") or "").split(":") + ["0", "0"])
+        return int(h) * 60 + int(mi) if str(m.get("duration", "")).count(":") >= 1 else 0
+    except (ValueError, TypeError):
+        return 0
+
+
+def write_sidecars(meta, dest):
+    kind = meta.get("kind")
+    if kind == "movie":
+        save_image(meta.get("poster"), dest.parent / "poster")
+        save_image(meta.get("fanart"), dest.parent / "background")
+        write_nfo(dest.with_suffix(".nfo"), "movie", [
+            ("title", meta.get("title")), ("year", meta.get("year")), ("premiered", meta.get("released")),
+            ("plot", meta.get("plot")), ("runtime", minutes(meta)), ("rating", meta.get("rating")),
+            ("genre", split_list(meta.get("genre"))), ("director", split_list(meta.get("director"), 5))],
+            actors=split_list(meta.get("cast"), 15), tmdb=meta.get("tmdb"))
+    elif kind == "episode":
+        show, season_dir = meta.get("show") or {}, dest.parent
+        show_dir = season_dir.parent
+        save_image(show.get("poster"), show_dir / "poster")
+        save_image(show.get("fanart"), show_dir / "background")
+        write_nfo(show_dir / "tvshow.nfo", "tvshow", [
+            ("title", show.get("title")), ("year", show.get("year")), ("premiered", show.get("released")),
+            ("plot", show.get("plot")), ("rating", show.get("rating")), ("genre", split_list(show.get("genre")))],
+            actors=split_list(show.get("cast"), 15), tmdb=show.get("tmdb"))
+        try:
+            n = int(meta.get("season") or 0)
+        except ValueError:
+            n = 0
+        # Plex: "Season 01/Season01.jpg" - Jellyfin: "season01-poster.jpg" in the show folder
+        save_image(meta.get("season_poster"), season_dir / f"Season{n:02d}", also=[show_dir / f"season{n:02d}-poster"])
+        # Plex: same name as the episode - Jellyfin: "<episode>-thumb"
+        save_image(meta.get("thumb"), dest.with_suffix(""), also=[dest.with_name(dest.stem + "-thumb")])
+        write_nfo(dest.with_suffix(".nfo"), "episodedetails", [
+            ("title", meta.get("title")), ("showtitle", show.get("title")), ("season", n), ("episode", meta.get("episode")),
+            ("aired", meta.get("aired")), ("plot", meta.get("plot")), ("runtime", minutes(meta))])
 
 
 def allowed_path(f, base=None):
@@ -400,7 +503,7 @@ class Downloader:
             self.prefs["audio_lang"] = lang_code(p["audio_lang"]) or "eng"
         if p.get("sub_lang"):
             self.prefs["sub_lang"] = "off" if p["sub_lang"] == "off" else (lang_code(p["sub_lang"]) or "eng")
-        for k in ("keep_audio", "srt"):
+        for k in ("keep_audio", "srt", "artwork"):
             if k in p:
                 self.prefs[k] = bool(p[k])
 
@@ -430,7 +533,7 @@ class Downloader:
 
     # the queue is saved so restarts and updates don't lose downloads (they resume from .part files)
     def persist(self):
-        keep = ("title", "url", "dest", "status", "done", "total", "error", "audio", "subs", "alang", "slang")
+        keep = ("title", "url", "dest", "status", "done", "total", "error", "audio", "subs", "alang", "slang", "meta")
         with self.lock:
             rows = [{k: j.get(k) for k in keep} for j in sorted(self.jobs.values(), key=lambda j: j["id"])
                     if j["status"] in ACTIVE + ("failed", "cancelled")]
@@ -479,7 +582,8 @@ class Downloader:
                                        "audio": aud if isinstance(aud, int) else None,
                                        "subs": sub if isinstance(sub, int) or sub == "none" else None,
                                        "alang": lang_code(it.get("alang")) if it.get("alang") else None,
-                                       "slang": ("off" if it.get("slang") == "off" else lang_code(it["slang"])) if it.get("slang") else None}
+                                       "slang": ("off" if it.get("slang") == "off" else lang_code(it["slang"])) if it.get("slang") else None,
+                                       "meta": it["meta"] if isinstance(it.get("meta"), dict) and len(json.dumps(it["meta"])) < 30000 else None}
                 busy.add(dest)
                 self.q.put(self.seq)
                 added += 1
@@ -553,6 +657,7 @@ class Downloader:
         if dest.exists():
             j["done"] = j["total"] = dest.stat().st_size
             j["status"] = "exists"
+            self._artwork(j, dest)
             return
         dest.parent.mkdir(parents=True, exist_ok=True)
         start = part.stat().st_size if part.exists() else 0
@@ -601,6 +706,14 @@ class Downloader:
         if part.exists():
             part.replace(dest)
         j["status"], j["speed"] = "done", 0
+        self._artwork(j, dest)
+
+    def _artwork(self, j, dest):
+        if j.get("meta") and self.prefs.get("artwork", True):
+            try:
+                write_sidecars(j["meta"], dest)
+            except Exception as e:  # noqa - artwork is a bonus, never fail a download over it
+                j["note"] = ((j.get("note") or "") + f" · artwork skipped ({e})").strip(" ·")
 
     def _tracks(self, j, part, dest):
         fmt = {".mkv": "matroska", ".mp4": "mp4", ".m4v": "mp4", ".mov": "mov"}.get(dest.suffix.lower())
@@ -1488,6 +1601,7 @@ video::cue{background:rgba(0,0,0,.72);font-size:1.05em}
       <div class="frow"><span>Subtitles</span><select id="pSub" style="grid-column:span 2" aria-label="Preferred subtitle language"></select></div>
       <label class="chk"><input type="checkbox" id="pKeep"> Keep the other audio languages too</label>
       <label class="chk"><input type="checkbox" id="pSrt"> Also save subtitles as a separate .srt file</label>
+      <label class="chk"><input type="checkbox" id="pArt"> Save posters, artwork &amp; info files for Plex/Jellyfin</label>
       <div id="ffNote" class="hidden"><small>FFmpeg isn't installed, so audio and subtitle choices are off and downloads keep every track as it is.</small>
         <div class="row" style="margin-top:6px"><button id="ffInstall" class="pri">Install FFmpeg</button><small id="ffState"></small></div></div>
     </div>
@@ -1660,11 +1774,49 @@ const DLREG = new Map(); let dlSeq = 0;
 const regDl = items => { const k = 'd' + (++dlSeq); DLREG.set(k, items); return k; };
 const extOf = (url, fb) => ((String(url).split('?')[0].match(/\.([a-z0-9]{2,5})$/i) || [])[1] || fb || 'mp4').toLowerCase();
 const pad2 = n => String(n).padStart(2, '0');
-const movieDl = (title, year, url, ext) => ({url, title, kind:'movie', path:[`${title}${year && !String(title).includes(year) ? ` (${year})` : ''}.${extOf(url, ext)}`]});
-function epDl(show, season, e){
+/* Names Plex & Jellyfin can match: strip IPTV prefixes/tags ("NF - ", "|EN| ", "[4K]", "MULTI"...) and pull out the year */
+const TAGS = 'EN|ENG|UK|US|USA|CA|AU|IE|FR|DE|GER|ES|ESP|IT|NL|PT|BR|PL|TR|AR|IN|HI|RU|JP|KR|CN|SE|SW|NO|DK|FI|GR|IR|PK|AF|EX|LA|LAT|LATAM|MULTI|VOD|NF|NFX|NETFLIX|AMZ|AMZN|AMAZON|PRIME|DSNP\\+?|DSN\\+?|D\\+|DISNEY\\+?|HBO|HMAX|MAX|ATV|ATVP|APPLE\\+?|APPLETV\\+?|HULU|PMNT|PARAMOUNT\\+?|PCOK|PEACOCK|SKY|STAN|CRAV|CRAVE|STARZ|SHO|4K|UHD|FHD|HD|SD|HEVC|TOP|NEW|KIDS';
+const PRE = new RegExp(`^\\s*(?:(?:\\[[^\\]]{1,14}\\]|\\|[^|]{1,14}\\||\\((?:${TAGS})\\))\\s*|(?:${TAGS})(?:[-+/ ](?:${TAGS}))*\\s*[-:|•▸]\\s+)+`, 'i');
+const POST = /\s*[\[(|-]?\s*(?:4K|UHD|FHD|HD|SD|HEVC|H\.?26[45]|x26[45]|2160p|1080p|720p|MULTI(?:[- ]?SUBS?)?|DUAL(?: AUDIO)?|VOSTFR|SUBBED|DUBBED|NF|AMZN)\s*[\])|]?\s*$/i;
+function cleanTitle(name){
+  let t = String(name || '').replace(PRE, '');
+  for (let i = 0; i < 4 && POST.test(t); i++) t = t.replace(POST, '');
+  let year = '';
+  const m = t.match(/\s*[([]?((?:19|20)\d{2})[)\]]?\s*$/);
+  if (m && m.index > 0) { year = m[1]; t = t.slice(0, m.index); }
+  t = t.replace(/\s+/g, ' ').replace(/[\s\-:|.]+$/, '').trim();
+  return {title:t || String(name || 'Untitled').trim(), year};
+}
+const yearOf = v => (String(v || '').match(/(?:19|20)\d{2}/) || [''])[0];
+const ymd = v => (String(v || '').match(/^\d{4}-\d{2}-\d{2}/) || [''])[0];
+const libName = (t, y, tmdb) => `${t}${y ? ` (${y})` : ''}${tmdb ? ` {tmdb-${tmdb}}` : ''}`;
+function movieDl(rawTitle, info, url, ext, img){
+  info = info || {}; const c = cleanTitle(info.name || rawTitle), year = yearOf(info.releasedate) || c.year;
+  const tmdb = /^\d+$/.test(String(info.tmdb_id || info.tmdb || '')) ? String(info.tmdb_id || info.tmdb) : '';
+  const base = `${c.title}${year ? ` (${year})` : ''}`;
+  return {url, title:rawTitle, kind:'movie', path:[libName(c.title, year, tmdb), `${base}.${extOf(url, ext)}`],
+    meta:{kind:'movie', title:c.title, year, tmdb, plot:info.plot || info.description || '', genre:info.genre || '', director:info.director || '',
+          cast:info.cast || info.actors || '', rating:info.rating || '', released:ymd(info.releasedate), duration:info.duration || '',
+          secs:info.duration_secs || '', poster:info.movie_image || info.cover_big || img || '', fanart:first(info.backdrop_path) || ''}};
+}
+function showInfo(rawName, info, img, seasonCovers){
+  info = info || {}; const c = cleanTitle(info.name || rawName);
+  const year = yearOf(info.releaseDate || info.release_date) || c.year;
+  const tmdb = /^\d+$/.test(String(info.tmdb || info.tmdb_id || '')) ? String(info.tmdb || info.tmdb_id) : '';
+  return {raw:rawName, title:c.title, year, tmdb, folder:libName(c.title, year, tmdb), seasons:seasonCovers || {},
+    meta:{title:c.title, year, tmdb, plot:info.plot || '', genre:info.genre || '', rating:info.rating || '', cast:info.cast || '',
+          released:ymd(info.releaseDate || info.release_date), poster:info.cover || img || '', fanart:first(info.backdrop_path) || ''}};
+}
+function epDl(SH, season, e){
   const tag = `S${pad2(season)}E${pad2(e.num)}`;
-  const name = `${show} ${tag}` + (e.title && !/S\d+\s*E\d+/i.test(e.title) && !/^Episode \d+$/i.test(e.title) ? ` - ${e.title}` : '');
-  return {url:e.url, title:`${show} ${tag}`, kind:'tv', path:[show, `Season ${pad2(season)}`, `${name}.${extOf(e.url, e.ext)}`]};
+  let et = String(e.title || '');
+  const after = et.match(/S\d+\s*E\d+\s*[-:.]?\s*(.*)$/i); if (after) et = after[1];
+  et = cleanTitle(et).title;
+  const good = et && !/^(Episode|Ep\.?|Épisode|Capítulo)\s*\d+$/i.test(et) && et.toLowerCase() !== SH.title.toLowerCase();
+  const base = `${SH.title}${SH.year ? ` (${SH.year})` : ''} - ${tag}${good ? ` - ${et}` : ''}`;
+  return {url:e.url, title:`${SH.title} ${tag}`, kind:'tv', path:[SH.folder, `Season ${pad2(season)}`, `${base}.${extOf(e.url, e.ext)}`],
+    meta:{kind:'episode', show:SH.meta, season:+season, episode:e.num, title:good ? et : `Episode ${e.num}`, plot:e.plot || '',
+          aired:ymd(e.aired), duration:e.dur || '', secs:e.secs || '', thumb:e.thumb || '', season_poster:SH.seasons[season] || ''}};
 }
 const actBtns = (url, title, dlk) => `<button class="pri" data-play="${esc(url)}" data-title="${esc(title)}" data-dlk="${dlk || ''}">▶ Play</button>
   ${dlk ? `<button data-dl="${dlk}">⬇ Download</button>` : ''}
@@ -1680,7 +1832,7 @@ const first = v => Array.isArray(v) ? v[0] : v;
 async function openMovie(it){
   const m = overlay(header({title:it.name, img:it.img, meta:['Loading details…']}));
   if (S.mode !== 'xtream') { m.innerHTML = '<button class="x" data-close>✕</button>' + header({title:it.name, img:it.img, meta:[it.cat],
-      actions:actBtns(it.url, it.name, regDl([movieDl(it.name, '', it.url)]))}); return; }
+      actions:actBtns(it.url, it.name, regDl([movieDl(it.name, null, it.url, null, it.img)]))}); return; }
   let info = {}, ext = it.ext;
   try { const d = await xt('get_vod_info', {vod_id:it.id}); info = d.info || {}; ext = (d.movie_data && d.movie_data.container_extension) || ext; } catch(e) {}
   const url = movieUrl(it.id, ext);
@@ -1689,36 +1841,40 @@ async function openMovie(it){
     backdrop: first(info.backdrop_path), plot: info.plot || info.description,
     meta: [info.releasedate ? String(info.releasedate).slice(0,4) : '', info.duration, info.genre, (info.rating || it.rating) ? '★ ' + (info.rating || it.rating) : '', (ext||'').toUpperCase(),
            info.director ? 'Dir. ' + info.director : '', info.cast ? 'Cast: ' + String(info.cast).split(',').slice(0,4).join(',') : ''],
-    actions: actBtns(url, it.name, regDl([movieDl(it.name, /^\d{4}$/.test(year) ? year : '', url, ext)]))});
+    actions: actBtns(url, it.name, regDl([movieDl(it.name, info, url, ext, it.img)]))});
 }
 
 async function openShow(it){
   const m = overlay(header({title:it.name, img:it.img, meta:['Loading episodes…']}));
-  let seasons = {}, info = {}, showName = it.name;
+  let seasons = {}, info = {}, showName = it.name, covers = {};
   if (S.mode === 'xtream') {
     try {
       const d = await xt('get_series_info', {series_id:it.id}); info = d.info || it.raw || {};
+      for (const se of (Array.isArray(d.seasons) ? d.seasons : [])) if (se && (se.cover_big || se.cover)) covers[String(+se.season_number)] = se.cover_big || se.cover;
       let eps = d.episodes || {};
       if (Array.isArray(eps)) { const g = {}; eps.flat().forEach(e => (g[e.season] = g[e.season] || []).push(e)); eps = g; }
       for (const [s, list] of Object.entries(eps)) seasons[s] = (list||[]).map(e => ({num:+e.episode_num || 0, title:e.title || ('Episode ' + e.episode_num),
-        plot:e.info && e.info.plot, dur:e.info && e.info.duration, ext:e.container_extension, url:epUrl(e.id, e.container_extension)}));
+        plot:e.info && e.info.plot, dur:e.info && e.info.duration, secs:e.info && e.info.duration_secs, thumb:e.info && e.info.movie_image,
+        aired:e.info && (e.info.releasedate || e.info.air_date), ext:e.container_extension, url:epUrl(e.id, e.container_extension)}));
     } catch(e) { m.innerHTML = '<button class="x" data-close>✕</button>' + header({title:it.name, img:it.img, meta:["Couldn't load episodes: " + e.message]}); return; }
   } else seasons = it.seasons;
   const keys = Object.keys(seasons).sort((a,b) => (+a) - (+b));
   const total = keys.reduce((n,k) => n + seasons[k].length, 0);
+  const SH = showInfo(showName, info, it.img, Object.fromEntries(Object.entries(covers).map(([k, v]) => [String(+k), v])));
+  for (const k of keys) if (covers[String(+k)]) SH.seasons[k] = covers[String(+k)];
   m.innerHTML = '<button class="x" data-close>✕</button>' + header({title:showName, img:info.cover || it.img, backdrop:first(info.backdrop_path), plot:info.plot,
     meta:[info.releaseDate || info.release_date ? String(info.releaseDate || info.release_date).slice(0,4) : '', info.genre, (info.rating || it.rating) ? '★ ' + (info.rating || it.rating) : '',
           `${keys.length} season${keys.length===1?'':'s'} · ${total} episodes`]})
     + `<div class="seasons"><div class="stabs">${keys.map((k,i) => `<button data-s="${esc(k)}" class="${i?'':'on'}">Season ${esc(k)}</button>`).join('')}
-       ${total ? `<button class="pri" data-dl="${regDl(keys.flatMap(k => seasons[k].map(e => epDl(showName, k, e))))}">⬇ Download all ${total} episodes</button>
+       ${total ? `<button class="pri" data-dl="${regDl(keys.flatMap(k => seasons[k].map(e => epDl(SH, k, e))))}">⬇ Download all ${total} episodes</button>
                   <button data-expall>Export all (.m3u)</button>` : ''}</div><div id="eps"></div></div>`;
   const show = k => {
     m.querySelectorAll('[data-s]').forEach(b => b.classList.toggle('on', b.dataset.s === k));
     const eps = seasons[k] || [];
     m.querySelector('#eps').innerHTML = (eps.length ? `<div class="actions" style="margin-bottom:10px">
-        <button data-dl="${regDl(eps.map(e => epDl(showName, k, e)))}">⬇ Download season ${esc(k)}</button>
+        <button data-dl="${regDl(eps.map(e => epDl(SH, k, e)))}">⬇ Download season ${esc(k)}</button>
         <button data-expseason="${esc(k)}">Export season ${esc(k)} (.m3u)</button></div>` : '<div class="empty">No episodes.</div>')
-      + eps.map(e => { const d = epDl(showName, k, e); return `<div class="ep"><div class="n">${e.num}</div>
+      + eps.map(e => { const d = epDl(SH, k, e); return `<div class="ep"><div class="n">${e.num}</div>
         <div class="info"><div>${esc(e.title)}</div><small>${esc([e.dur, e.plot].filter(Boolean).join(' · '))}</small></div>${actBtns(e.url, d.title, regDl([d]))}</div>`; }).join('');
   };
   const epEntries = ks => ks.flatMap(k => seasons[k].map(e => ({title:`${showName} S${String(k).padStart(2,'0')}E${String(e.num).padStart(2,'0')} - ${e.title}`, url:e.url, group:showName})));
@@ -1977,17 +2133,17 @@ async function installFF(){
 function fillPrefs(){
   if (document.activeElement !== $('#pAudio')) $('#pAudio').innerHTML = langOpts(PREFS.audio_lang, false);
   if (document.activeElement !== $('#pSub')) $('#pSub').innerHTML = langOpts(PREFS.sub_lang, true);
-  $('#pKeep').checked = !!PREFS.keep_audio; $('#pSrt').checked = !!PREFS.srt;
+  $('#pKeep').checked = !!PREFS.keep_audio; $('#pSrt').checked = !!PREFS.srt; $('#pArt').checked = PREFS.artwork !== false;
   $('#ffNote').classList.toggle('hidden', FF);
   $('#ffInstall').classList.toggle('hidden', !FF_CAN || FFI.state === 'installing');
   $('#ffState').textContent = ffStateText();
 }
 $('#ffInstall').onclick = installFF;
 const savePrefs = async () => {
-  try { const d = await post('/api/settings', {prefs:{audio_lang:$('#pAudio').value, sub_lang:$('#pSub').value, keep_audio:$('#pKeep').checked, srt:$('#pSrt').checked}});
+  try { const d = await post('/api/settings', {prefs:{audio_lang:$('#pAudio').value, sub_lang:$('#pSub').value, keep_audio:$('#pKeep').checked, srt:$('#pSrt').checked, artwork:$('#pArt').checked}});
         PREFS = d.prefs; toast('Audio & subtitle defaults saved'); } catch(e) { toast(e.message); }
 };
-['#pAudio', '#pSub', '#pKeep', '#pSrt'].forEach(id => $(id).onchange = savePrefs);
+['#pAudio', '#pSub', '#pKeep', '#pSrt', '#pArt'].forEach(id => $(id).onchange = savePrefs);
 const LANG2 = {eng:'en', spa:'es', fre:'fr', ger:'de', ita:'it', por:'pt', dut:'nl', pol:'pl', tur:'tr', ara:'ar', hin:'hi', rus:'ru', jpn:'ja', kor:'ko', chi:'zh', swe:'sv', nor:'no', dan:'da', fin:'fi', gre:'el', heb:'he', per:'fa', rum:'ro', hun:'hu', cze:'cs', ukr:'uk'};
 function vlcOpts(it){
   const o = [];
