@@ -14,6 +14,10 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
+        if ! command -v ffmpeg >/dev/null 2>&1; then
+          echo "Installing FFmpeg for audio & subtitle choices (first start only)..."
+          apk add --no-cache ffmpeg >/dev/null 2>&1 || echo "FFmpeg couldn't be installed - audio/subtitle choices will be off"
+        fi
         if [ ! -f /app/iptv_library.py ]; then
           echo "Downloading IPTV Library from GitHub..."
           python -c "import urllib.request as u; u.urlretrieve('https://github.com/Fudgeamin99/iptvarr/releases/latest/download/iptv_library.py', '/app/iptv_library.py')"
@@ -25,6 +29,8 @@ services:
       PYTHONUNBUFFERED: "1"
       IPTV_DOWNLOADS: /downloads
       IPTV_BROWSE_ROOT: /downloads     # the in-app folder picker stays inside your download share(s)
+      IPTV_AUDIO_LANG: eng             # default audio language (change any time in the app)
+      IPTV_SUB_LANG: eng               # default subtitle language, or "off"
       IPTV_CONFIG_DIR: /config
       IPTV_UMASK: "000"                # downloaded files can be moved/deleted by any NAS user over SMB
       # Recommended - otherwise anyone on your Wi-Fi can open the app.

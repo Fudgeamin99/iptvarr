@@ -11,6 +11,8 @@ It runs in Docker on UGREEN, Synology, Unraid or any other Docker host, and you 
 - **Download** movies, single episodes, whole seasons or entire shows straight to your NAS, saved as
   `Title (Year).mkv` and `Show/Season 01/Show S01E01 - Title.mp4`
   - choose **separate folders for Movies and TV Shows** with a built-in folder browser
+- **Audio & subtitles:** see every audio track and subtitle in a title and pick the ones you want (English by default).
+  Downloads keep just your choice (no re-encoding, so there's no quality loss), with an optional `.srt` file that Plex and Jellyfin pick up. VLC opens with the same choice.
   - progress, speed and time left, and downloads resume after a dropped connection or a restart
 - **Export** any list as an `.m3u` playlist or a `.csv` spreadsheet
 - **One-click updates** from this repo's releases
@@ -46,6 +48,10 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
+        if ! command -v ffmpeg >/dev/null 2>&1; then
+          echo "Installing FFmpeg for audio & subtitle choices (first start only)..."
+          apk add --no-cache ffmpeg >/dev/null 2>&1 || echo "FFmpeg couldn't be installed - audio/subtitle choices will be off"
+        fi
         if [ ! -f /app/iptv_library.py ]; then
           echo "Downloading IPTV Library from GitHub..."
           python -c "import urllib.request as u; u.urlretrieve('https://github.com/Fudgeamin99/iptvarr/releases/latest/download/iptv_library.py', '/app/iptv_library.py')"
@@ -57,6 +63,8 @@ services:
       PYTHONUNBUFFERED: "1"
       IPTV_DOWNLOADS: /downloads
       IPTV_BROWSE_ROOT: /downloads     # the in-app folder picker stays inside your download share(s)
+      IPTV_AUDIO_LANG: eng             # default audio language (change any time in the app)
+      IPTV_SUB_LANG: eng               # default subtitle language, or "off"
       IPTV_CONFIG_DIR: /config
       IPTV_UMASK: "000"                # downloaded files can be moved/deleted by any NAS user over SMB
       # Recommended - otherwise anyone on your Wi-Fi can open the app.
@@ -80,7 +88,7 @@ services:
       start_period: 30s
 ```
 
-On first start the container downloads the app from the latest release into `./app`. You don't need to build an image.
+On first start the container installs FFmpeg (for audio and subtitle choices) and downloads the app from the latest release into `./app`, so the first start takes a minute. You don't need to build an image.
 The same file is also in the repo as [`docker-compose.yml`](docker-compose.yml) and attached to every release.
 
 ### Settings
@@ -90,12 +98,24 @@ The same file is also in the repo as [`docker-compose.yml`](docker-compose.yml) 
 | `IPTV_DOWNLOADS` | Download share inside the container (keep it as `/downloads` and change the volume instead) |
 | `IPTV_MOVIES_DIR` / `IPTV_TV_DIR` | Optional starting folders for Movies and TV Shows (default `/downloads/Movies` and `/downloads/TV Shows`; you can change them in the app) |
 | `IPTV_BROWSE_ROOT` | Keeps the in-app folder picker inside this folder |
+| `IPTV_AUDIO_LANG` / `IPTV_SUB_LANG` | Starting audio and subtitle languages (`eng`, `spa`, `fre`, …; subtitles can be `off`). You can change them in the app |
 | `IPTV_CONFIG_DIR` | Where settings and the download queue are saved |
 | `IPTV_APP_PASSWORD` / `IPTV_APP_USER` | Password-protect the app (user defaults to `iptv`) |
 | `IPTV_UMASK` | Permission mask for downloaded files (`000` lets every NAS user move/delete them) |
 | `IPTV_REPO` | GitHub repo the Update button checks (default `Fudgeamin99/iptvarr`) |
 
 Keep **"At the same time"** in the Downloads panel at 1 unless your IPTV plan allows more connections, or your other devices may get cut off.
+
+## Audio & subtitles
+
+Click **🎧 Audio & subtitles** on any movie or episode to see what's inside the file, e.g. *English · AC3 5.1*,
+*Spanish · AAC Stereo*, *English (forced)*, and pick what you want. Seasons and whole shows use your default languages,
+which you set under **⬇ Downloads → Audio & subtitles**: audio language, subtitle language (or Off), whether to keep the
+other audio languages, and whether to also save an `.srt`.
+
+What you can pick depends on your provider: many IPTV files only have one audio track and no subtitles.
+Downloads are remuxed with FFmpeg (copied, not re-encoded). If anything goes wrong, the original file is kept.
+Picture-based subtitles (PGS/DVD) can be kept inside `.mkv` files but can't be turned into `.srt`.
 
 ## Updating
 

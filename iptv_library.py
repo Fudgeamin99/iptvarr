@@ -35,7 +35,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 REPO = os.environ.get("IPTV_REPO", "Fudgeamin99/iptvarr")   # GitHub repo the Update button checks
 UA = "Mozilla/5.0 (IPTV Library) VLC/3.0.20"
 # Many IPTV panels use self-signed / expired certificates.
@@ -125,7 +125,7 @@ JUNK_DIRS = ("@eaDir", "#recycle", "#snapshot", "@Recycle", "$RECYCLE.BIN", "Sys
 CAN_OPEN = sys.platform.startswith("win") or sys.platform == "darwin" or bool(shutil.which("xdg-open"))
 BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
-ACTIVE = ("queued", "downloading")
+ACTIVE = ("queued", "downloading", "processing")
 
 
 def clean_segment(s):
@@ -156,6 +156,101 @@ def save_settings(d):
 
 class Cancelled(Exception):
     pass
+
+
+# ---------------------------------------------------------------- Audio & subtitle tracks (needs FFmpeg)
+FFMPEG, FFPROBE = shutil.which("ffmpeg"), shutil.which("ffprobe")
+# (code used in settings, name, ISO 639-1 for .srt names, every tag spelling seen in the wild)
+LANGS = [
+    ("eng", "English", "en", "en eng english"), ("spa", "Spanish", "es", "es spa esp spanish espanol español castellano"),
+    ("fre", "French", "fr", "fr fre fra french francais français"), ("ger", "German", "de", "de ger deu german deutsch"),
+    ("ita", "Italian", "it", "it ita italian italiano"), ("por", "Portuguese", "pt", "pt por portuguese portugues português pob ptbr pt-br"),
+    ("dut", "Dutch", "nl", "nl dut nld dutch nederlands"), ("pol", "Polish", "pl", "pl pol polish polski"),
+    ("tur", "Turkish", "tr", "tr tur turkish turkce türkçe"), ("ara", "Arabic", "ar", "ar ara arabic"),
+    ("hin", "Hindi", "hi", "hi hin hindi"), ("urd", "Urdu", "ur", "ur urd urdu"), ("ben", "Bengali", "bn", "bn ben bengali bangla"),
+    ("pan", "Punjabi", "pa", "pa pan punjabi"), ("tam", "Tamil", "ta", "ta tam tamil"), ("tel", "Telugu", "te", "te tel telugu"),
+    ("mal", "Malayalam", "ml", "ml mal malayalam"), ("rus", "Russian", "ru", "ru rus russian"), ("ukr", "Ukrainian", "uk", "uk ukr ukrainian"),
+    ("jpn", "Japanese", "ja", "ja jpn japanese"), ("kor", "Korean", "ko", "ko kor korean"), ("chi", "Chinese", "zh", "zh chi zho chinese mandarin cantonese"),
+    ("swe", "Swedish", "sv", "sv swe swedish svenska"), ("nor", "Norwegian", "no", "no nor nob nno norwegian norsk"),
+    ("dan", "Danish", "da", "da dan danish dansk"), ("fin", "Finnish", "fi", "fi fin finnish suomi"), ("gre", "Greek", "el", "el gre ell greek"),
+    ("heb", "Hebrew", "he", "he heb hebrew"), ("per", "Persian", "fa", "fa per fas persian farsi"), ("rum", "Romanian", "ro", "ro rum ron romanian"),
+    ("hun", "Hungarian", "hu", "hu hun hungarian magyar"), ("cze", "Czech", "cs", "cs cze ces czech"), ("slo", "Slovak", "sk", "sk slo slk slovak"),
+    ("bul", "Bulgarian", "bg", "bg bul bulgarian"), ("hrv", "Croatian", "hr", "hr hrv croatian"), ("srp", "Serbian", "sr", "sr srp serbian"),
+    ("alb", "Albanian", "sq", "sq alb sqi albanian shqip"), ("vie", "Vietnamese", "vi", "vi vie vietnamese"), ("tha", "Thai", "th", "th tha thai"),
+    ("ind", "Indonesian", "id", "id ind indonesian"), ("may", "Malay", "ms", "ms may msa malay"), ("fil", "Filipino", "tl", "tl fil tgl filipino tagalog"),
+    ("kur", "Kurdish", "ku", "ku kur kurdish"), ("som", "Somali", "so", "so som somali"),
+]
+LANG_ALIASES = {a: code for code, _, _, al in LANGS for a in al.split()}
+LANG_NAME = {code: name for code, name, _, _ in LANGS}
+LANG_2 = {code: two for code, _, two, _ in LANGS}
+TEXT_SUBS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text", "tx3g"}
+TRACK_CACHE = {}
+
+
+def lang_code(tag):
+    t = str(tag or "").strip().lower()
+    return LANG_ALIASES.get(t) or LANG_ALIASES.get(t.split("-")[0].split("_")[0]) or ("" if t in ("und", "unk", "") else t)
+
+
+def probe_tracks(src, remote=True):
+    """List the audio and subtitle tracks inside a video (a URL or a local file)."""
+    if not FFPROBE:
+        raise RuntimeError("FFmpeg isn't installed, so tracks can't be read")
+    if remote and src in TRACK_CACHE:
+        return TRACK_CACHE[src]
+    cmd = [FFPROBE, "-v", "error", "-print_format", "json", "-show_streams"]
+    if remote:
+        if not src.startswith(("http://", "https://")):
+            raise ValueError("Only http(s) links can be checked")
+        cmd += ["-user_agent", UA, "-protocol_whitelist", "http,https,tcp,tls,crypto", "-rw_timeout", "20000000"]
+    r = subprocess.run(cmd + [src], capture_output=True, timeout=90)
+    if r.returncode:
+        raise RuntimeError("Couldn't read the file's tracks: " + (r.stderr.decode("utf-8", "replace").strip().splitlines() or ["unknown error"])[-1][:200])
+    audio, subs = [], []
+    for st in json.loads(r.stdout or b"{}").get("streams", []):
+        tags = {k.lower(): v for k, v in (st.get("tags") or {}).items()}
+        disp = st.get("disposition") or {}
+        lang = lang_code(tags.get("language"))
+        t = {"index": st.get("index"), "lang": lang, "lang_name": LANG_NAME.get(lang, lang.upper() if lang else ""),
+             "title": tags.get("title", ""), "codec": st.get("codec_name", ""), "default": bool(disp.get("default")),
+             "forced": bool(disp.get("forced")) or "forced" in tags.get("title", "").lower()}
+        if st.get("codec_type") == "audio":
+            audio.append({**t, "n": len(audio), "channels": st.get("channels") or 0})
+        elif st.get("codec_type") == "subtitle":
+            subs.append({**t, "n": len(subs), "text": t["codec"] in TEXT_SUBS})
+    res = {"audio": audio, "subs": subs}
+    if remote:
+        TRACK_CACHE[src] = res
+    return res
+
+
+def pick_audio(audio, want, lang):
+    if not audio:
+        return None
+    if isinstance(want, int):
+        for a in audio:
+            if a["index"] == want:
+                return a
+    same = [a for a in audio if a["lang"] == lang]
+    if same:
+        return sorted(same, key=lambda a: (not a["default"], -a["channels"]))[0]
+    return next((a for a in audio if a["default"]), audio[0])
+
+
+def pick_sub(subs, want, lang):
+    if want == "none" or not subs:
+        return None
+    if isinstance(want, int):
+        for x in subs:
+            if x["index"] == want:
+                return x
+    if not lang or lang == "off":
+        return None
+    same = [x for x in subs if x["lang"] == lang]
+    return sorted(same, key=lambda x: (x["forced"], not x["text"]))[0] if same else None
+
+
+DEFAULT_PREFS = {"audio_lang": "eng", "sub_lang": "eng", "keep_audio": False, "srt": True}
 
 
 def allowed_path(f, base=None):
@@ -190,14 +285,25 @@ def list_folders(path, base):
 
 
 class Downloader:
-    def __init__(self, folder, workers, movies=None, tv=None):
+    def __init__(self, folder, workers, movies=None, tv=None, prefs=None):
         self.lock = threading.Lock()
         self.jobs, self.seq, self.threads, self.max = {}, 0, 0, 1
         self.q = queue.Queue()
         self.folder = Path(folder).expanduser()
         self.movies = Path(movies).expanduser() if movies else self.folder / "Movies"
         self.tv = Path(tv).expanduser() if tv else self.folder / "TV Shows"
+        self.prefs = dict(DEFAULT_PREFS)
+        self.set_prefs(prefs or {})
         self.set_workers(workers)
+
+    def set_prefs(self, p):
+        if p.get("audio_lang"):
+            self.prefs["audio_lang"] = lang_code(p["audio_lang"]) or "eng"
+        if p.get("sub_lang"):
+            self.prefs["sub_lang"] = "off" if p["sub_lang"] == "off" else (lang_code(p["sub_lang"]) or "eng")
+        for k in ("keep_audio", "srt"):
+            if k in p:
+                self.prefs[k] = bool(p[k])
 
     # settings
     def set_workers(self, n):
@@ -220,14 +326,15 @@ class Downloader:
             self.tv = p
 
     def save(self):
-        save_settings({"folder": str(self.folder), "movies": str(self.movies), "tv": str(self.tv), "workers": self.max})
+        save_settings({"folder": str(self.folder), "movies": str(self.movies), "tv": str(self.tv), "workers": self.max,
+                       "prefs": self.prefs})
 
     # the queue is saved so restarts and updates don't lose downloads (they resume from .part files)
     def persist(self):
-        keep = ("title", "url", "dest", "status", "done", "total", "error")
+        keep = ("title", "url", "dest", "status", "done", "total", "error", "audio", "subs")
         with self.lock:
-            rows = [{k: j[k] for k in keep} for j in sorted(self.jobs.values(), key=lambda j: j["id"])
-                    if j["status"] in ("queued", "downloading", "failed", "cancelled")]
+            rows = [{k: j.get(k) for k in keep} for j in sorted(self.jobs.values(), key=lambda j: j["id"])
+                    if j["status"] in ACTIVE + ("failed", "cancelled")]
         try:
             tmp = JOBS_FILE.with_name(JOBS_FILE.name + ".tmp")
             tmp.write_text(json.dumps(rows))
@@ -244,7 +351,7 @@ class Downloader:
             for r in rows:
                 self.seq += 1
                 st = "queued" if r.get("status") in ACTIVE else r.get("status", "failed")
-                self.jobs[self.seq] = {**r, "id": self.seq, "status": st, "speed": 0, "cancel": False}
+                self.jobs[self.seq] = {**r, "id": self.seq, "status": st, "speed": 0, "cancel": False, "note": ""}
                 if st == "queued":
                     self.q.put(self.seq)
 
@@ -266,9 +373,12 @@ class Downloader:
                     skipped += 1
                     continue
                 self.seq += 1
+                aud, sub = it.get("audio"), it.get("subs")
                 self.jobs[self.seq] = {"id": self.seq, "title": str(it.get("title") or segs[-1]), "url": url,
                                        "dest": dest, "status": "queued", "done": 0, "total": 0,
-                                       "speed": 0, "error": "", "cancel": False}
+                                       "speed": 0, "error": "", "cancel": False, "note": "",
+                                       "audio": aud if isinstance(aud, int) else None,
+                                       "subs": sub if isinstance(sub, int) or sub == "none" else None}
                 busy.add(dest)
                 self.q.put(self.seq)
                 added += 1
@@ -300,10 +410,11 @@ class Downloader:
         self.persist()
 
     def snapshot(self):
-        keep = ("id", "title", "dest", "status", "done", "total", "speed", "error")
+        keep = ("id", "title", "dest", "status", "done", "total", "speed", "error", "note")
         return {"folder": str(self.folder), "movies_folder": str(self.movies), "tv_folder": str(self.tv),
-                "workers": self.max, "can_open": CAN_OPEN,
-                "jobs": [{k: j[k] for k in keep} for j in sorted(self.jobs.values(), key=lambda j: -j["id"])]}
+                "workers": self.max, "can_open": CAN_OPEN, "prefs": self.prefs, "ffmpeg": bool(FFMPEG and FFPROBE),
+                "langs": [[c, n] for c, n, _, _ in LANGS],
+                "jobs": [{k: j.get(k, "") for k in keep} for j in sorted(self.jobs.values(), key=lambda j: -j["id"])]}
 
     # workers
     def _worker(self, idx):
@@ -350,10 +461,8 @@ class Downloader:
             resp = urllib.request.urlopen(urllib.request.Request(j["url"], headers=headers), timeout=60, context=CTX)
         except urllib.error.HTTPError as e:
             if e.code == 416 and start:     # .part already holds the whole file
-                part.replace(dest)
                 j["done"] = j["total"] = start
-                j["status"] = "done"
-                return
+                return self._finish(j, part, dest)
             raise
         with resp:
             if start and resp.status != 206:
@@ -378,8 +487,60 @@ class Downloader:
                         j["speed"], t0, b0 = (j["done"] - b0) / (now - t0), now, j["done"]
         if j["total"] and j["done"] < j["total"]:
             raise RuntimeError("Connection dropped - resuming")
-        part.replace(dest)
-        j["status"], j["error"] = "done", ""
+        self._finish(j, part, dest)
+
+    def _finish(self, j, part, dest):
+        """Apply the audio/subtitle choice (if FFmpeg is there), then put the file in place."""
+        j["error"] = ""
+        try:
+            self._tracks(j, part, dest)
+        except Exception as e:  # noqa - never lose a finished download over this
+            j["note"] = f"Kept the original file (couldn't change tracks: {e})"
+        if part.exists():
+            part.replace(dest)
+        j["status"], j["speed"] = "done", 0
+
+    def _tracks(self, j, part, dest):
+        fmt = {".mkv": "matroska", ".mp4": "mp4", ".m4v": "mp4", ".mov": "mov"}.get(dest.suffix.lower())
+        if not (FFMPEG and FFPROBE and fmt):
+            return
+        tr = probe_tracks(str(part), remote=False)
+        audio, subs = tr["audio"], tr["subs"]
+        if len(audio) <= 1 and not subs:
+            return                                     # nothing to choose between
+        P = self.prefs
+        a = pick_audio(audio, j.get("audio"), P["audio_lang"])
+        sub = pick_sub(subs, j.get("subs"), P["sub_lang"])
+        order = ([a] + ([x for x in audio if x is not a] if P["keep_audio"] else [])) if a else []
+        embed = bool(sub) and (fmt == "matroska" or sub["text"])
+        j["status"] = "processing"
+        j["note"] = "Audio: " + ((a["lang_name"] or "default") if a else "none") + \
+                    " · Subtitles: " + ((sub["lang_name"] or "on") if sub else "off")
+        tmp = dest.with_name(dest.stem + ".processing" + dest.suffix)
+        cmd = [FFMPEG, "-v", "error", "-y", "-i", str(part), "-map", "0:v?"]
+        for x in order:
+            cmd += ["-map", f"0:{x['index']}"]
+        if embed:
+            cmd += ["-map", f"0:{sub['index']}"]
+        if fmt == "matroska":
+            cmd += ["-map", "0:t?"]                      # keep attached fonts for styled subtitles
+        cmd += ["-c", "copy"]
+        if embed and fmt != "matroska":
+            cmd += ["-c:s", "mov_text"]
+        for i in range(len(order)):
+            cmd += [f"-disposition:a:{i}", "default" if i == 0 else "0"]
+        if embed:
+            cmd += ["-disposition:s:0", "default"]
+        r = subprocess.run(cmd + ["-f", fmt, str(tmp)], capture_output=True, timeout=6 * 3600)
+        if r.returncode or not tmp.exists():
+            tmp.unlink(missing_ok=True) if tmp.exists() else None
+            raise RuntimeError((r.stderr.decode("utf-8", "replace").strip().splitlines() or ["FFmpeg failed"])[-1][:200])
+        if sub and sub["text"] and P["srt"]:            # a separate .srt too, which Plex/Jellyfin/TVs pick up
+            name = f"{dest.stem}.{LANG_2.get(sub['lang'], sub['lang'] or 'und')}{'.forced' if sub['forced'] else ''}.srt"
+            subprocess.run([FFMPEG, "-v", "error", "-y", "-i", str(part), "-map", f"0:{sub['index']}", "-c:s", "srt",
+                            str(dest.with_name(name))], capture_output=True, timeout=600)
+        os.replace(tmp, dest)
+        part.unlink(missing_ok=True)
 
 
 def open_folder(p):
@@ -520,6 +681,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(200, list_folders(q.get("path"), DL.folder))
                 except ValueError as e:
                     return self.send(400, {"error": str(e)})
+            if u.path == "/api/tracks":
+                try:
+                    return self.send(200, probe_tracks(q.get("url", "")))
+                except Exception as e:  # noqa
+                    return self.send(400, {"error": str(e), "no_ffmpeg": not FFPROBE})
             if u.path == "/api/version":
                 return self.send(200, {"version": VERSION})
             if u.path == "/api/update/check":
@@ -573,6 +739,8 @@ class Handler(BaseHTTPRequestHandler):
                     DL.set_kind_folder("tv", body["tv_folder"])
                 if body.get("workers"):
                     DL.set_workers(body["workers"])
+                if isinstance(body.get("prefs"), dict):
+                    DL.set_prefs(body["prefs"])
                 DL.save()
             elif p == "/api/open-folder":
                 open_folder(DL.folder)
@@ -598,7 +766,9 @@ def main():
               or str(Path.home() / "Downloads" / "IPTV Library"))
     DL = Downloader(folder, st.get("workers", 1),
                     movies=st.get("movies") or os.environ.get("IPTV_MOVIES_DIR"),
-                    tv=st.get("tv") or os.environ.get("IPTV_TV_DIR"))
+                    tv=st.get("tv") or os.environ.get("IPTV_TV_DIR"),
+                    prefs=st.get("prefs") or {"audio_lang": os.environ.get("IPTV_AUDIO_LANG"),
+                                               "sub_lang": os.environ.get("IPTV_SUB_LANG")})
     print(f"IPTV Library v{VERSION}  -  movies: {DL.movies}  -  TV shows: {DL.tv}")
     srv = None
     if os.environ.pop("IPTV_RESTART", None):       # restarting after an update: wait for the old copy to let go
@@ -720,7 +890,8 @@ main{overflow:auto;padding:18px}
 #dl .dh{padding:16px 18px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:10px}
 #dl .dh h3{margin:0;font-size:17px;display:flex;justify-content:space-between;align-items:center}
 #dl .dh small{color:var(--mute)}
-#dlList{overflow:auto;flex:1;padding:12px 18px;display:flex;flex-direction:column;gap:10px}
+#dl{overflow-y:auto}#dl .dh{flex:none}
+#dlList{flex:1 0 auto;padding:12px 18px;display:flex;flex-direction:column;gap:10px}
 .job{background:var(--panel2);border-radius:9px;padding:10px 12px}
 .job .jt{display:flex;gap:8px;align-items:center}.job .jt div{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600}
 .job .jt button{padding:4px 9px;font-size:12px}
@@ -741,6 +912,11 @@ main{overflow:auto;padding:18px}
 #pkList button{text-align:left;border:0;background:none;padding:8px 10px;border-radius:7px}
 #pkList button:hover{background:var(--panel2)}
 #pkList .empty{padding:14px;font-size:13px}
+#trk{z-index:12}#trk .modal{width:min(560px,100%)}
+.tk{padding:24px;display:flex;flex-direction:column;gap:12px}.tk h2{margin:0;font-size:19px;padding-right:40px}
+.tk label{margin:6px 0 0}.tk .note{color:var(--mute);font-size:13px;margin:0}
+#dl .prefs{display:flex;flex-direction:column;gap:8px;border-top:1px solid var(--line);padding-top:10px}
+#dl .prefs .chk{margin:0;font-size:13px}#ffNote{color:var(--acc2)}
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--acc);color:#1a1205;padding:9px 16px;border-radius:8px;font-weight:600;z-index:20}
 @media (max-width:760px){#app{grid-template-columns:1fr}aside{display:none}header{flex-wrap:wrap}.mbody{flex-direction:column;margin-top:-60px}.mbody h2{margin-top:0}}
 </style></head><body>
@@ -788,6 +964,7 @@ main{overflow:auto;padding:18px}
 </section>
 
 <div id="ov" class="ov hidden"></div>
+<div id="trk" class="ov hidden"></div>
 
 <div id="dl" class="hidden">
   <div class="dh">
@@ -806,6 +983,14 @@ main{overflow:auto;padding:18px}
     <div class="row"><label style="margin:0;white-space:nowrap">At the same time</label>
       <select id="dlWorkers" style="width:auto"><option>1</option><option>2</option><option>3</option><option>4</option></select>
       <small>Keep within your account's connection limit</small></div>
+    <div class="prefs">
+      <label style="margin:0">Audio &amp; subtitles (when a title has a choice)</label>
+      <div class="frow"><span>Audio</span><select id="pAudio" style="grid-column:span 2" aria-label="Preferred audio language"></select></div>
+      <div class="frow"><span>Subtitles</span><select id="pSub" style="grid-column:span 2" aria-label="Preferred subtitle language"></select></div>
+      <label class="chk"><input type="checkbox" id="pKeep"> Keep the other audio languages too</label>
+      <label class="chk"><input type="checkbox" id="pSrt"> Also save subtitles as a separate .srt file</label>
+      <small id="ffNote" class="hidden">FFmpeg isn't installed, so audio and subtitle choices can't be applied to downloads. Use the latest docker-compose.yml from GitHub (it installs FFmpeg).</small>
+    </div>
     <div class="row"><button id="dlRetry">Retry failed</button><button id="dlCancel">Cancel all</button><button id="dlClear">Clear finished</button></div>
   </div>
   <div id="dlList"></div>
@@ -938,7 +1123,8 @@ $('#grid').onclick = e => { const t = e.target.closest('.tile'); if (t) (S.tab =
 function overlay(html, cls='modal'){ const o = $('#ov'); o.innerHTML = `<div class="${cls}"><button class="x" data-close>✕</button>${html}</div>`; o.classList.remove('hidden'); return o.firstChild; }
 function closeOv(){ const o = $('#ov'); o.querySelectorAll('video').forEach(v => { v.pause(); v.removeAttribute('src'); v.load(); }); o.classList.add('hidden'); o.innerHTML = ''; }
 $('#ov').addEventListener('click', e => { if (e.target.id === 'ov' || e.target.closest('[data-close]')) closeOv(); });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeOv(); });
+document.addEventListener('keydown', e => { if (e.key !== 'Escape') return;
+  const t = document.getElementById('trk'); if (t && !t.classList.contains('hidden')) { t.classList.add('hidden'); t.innerHTML = ''; } else closeOv(); });
 
 /* download items are registered by key so buttons can carry them */
 const DLREG = new Map(); let dlSeq = 0;
@@ -953,7 +1139,8 @@ function epDl(show, season, e){
 }
 const actBtns = (url, title, dlk) => `<button class="pri" data-play="${esc(url)}" data-title="${esc(title)}" data-dlk="${dlk || ''}">▶ Play</button>
   ${dlk ? `<button data-dl="${dlk}">⬇ Download</button>` : ''}
-  <button data-vlc="${esc(url)}" data-title="${esc(title)}">Open in VLC (.m3u)</button><button data-copy="${esc(url)}">Copy link</button>`;
+  ${dlk ? `<button data-trk="${dlk}">🎧 Audio &amp; subtitles</button>` : ''}
+  <button data-vlc="${esc(url)}" data-title="${esc(title)}" data-dlk="${dlk || ''}">Open in VLC (.m3u)</button><button data-copy="${esc(url)}">Copy link</button>`;
 function header(o){
   return `<div class="hero" style="${o.backdrop ? `background-image:url('${esc(o.backdrop)}')` : ''}"></div>
   <div class="mbody"><div class="pp">${o.img ? `<img src="${esc(o.img)}" onerror="this.remove()">` : ''}</div>
@@ -1021,7 +1208,9 @@ document.addEventListener('click', e => {
   const b = e.target.closest('button'); if (!b) return;
   if (b.dataset.play) play(b.dataset.play, b.dataset.title, b.dataset.dlk);
   else if (b.dataset.dl) queueDownloads(DLREG.get(b.dataset.dl));
-  else if (b.dataset.vlc) downloadM3u(b.dataset.title, [{title:b.dataset.title, url:b.dataset.vlc}]);
+  else if (b.dataset.trk) openTracks(b.dataset.trk);
+  else if (b.dataset.vlc) { const it = b.dataset.dlk && (DLREG.get(b.dataset.dlk) || [])[0];
+    downloadM3u(b.dataset.title, [{title:b.dataset.title, url:b.dataset.vlc, opts: it ? vlcOpts(it) : null}]); }
   else if (b.dataset.copy) navigator.clipboard.writeText(b.dataset.copy).then(() => toast('Link copied'), () => prompt('Copy this link:', b.dataset.copy));
 });
 function play(url, title, dlk){
@@ -1046,10 +1235,10 @@ async function queueDownloads(items){
 }
 const fmtB = n => { if (!n) return '0 B'; const u = ['B','KB','MB','GB','TB']; const i = Math.min(4, Math.floor(Math.log(n) / Math.log(1024))); return (n / 1024 ** i).toFixed(i > 1 ? 1 : 0) + ' ' + u[i]; };
 const fmtT = s => { s = Math.round(s); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`; };
-const STATUS = {queued:'Waiting', downloading:'Downloading', done:'Finished', exists:'Already downloaded', failed:'Failed', cancelled:'Cancelled'};
+const STATUS = {queued:'Waiting', downloading:'Downloading', processing:'Applying audio & subtitle choice…', done:'Finished', exists:'Already downloaded', failed:'Failed', cancelled:'Cancelled'};
 let dlTimer = null, dlOpen = false;
 function renderDl(d){
-  const active = d.jobs.filter(j => j.status === 'queued' || j.status === 'downloading').length;
+  const active = d.jobs.filter(j => ['queued', 'downloading', 'processing'].includes(j.status)).length;
   $('#dlBadge').textContent = active; $('#dlBadge').classList.toggle('hidden', !active);
   if (!dlOpen) return;
   $('#dlList').innerHTML = d.jobs.length ? d.jobs.map(j => {
@@ -1058,6 +1247,7 @@ function renderDl(d){
     if (j.status === 'downloading') line = `${fmtB(j.done)}${j.total ? ' of ' + fmtB(j.total) : ''}` + (j.speed ? ` · ${fmtB(j.speed)}/s` : '') + (j.speed && j.total ? ` · ${fmtT((j.total - j.done) / j.speed)} left` : '') + (j.error ? ` · retrying (${j.error})` : '');
     else if (j.status === 'done' || j.status === 'exists') line += ' · ' + fmtB(j.total);
     else if (j.error) line += ' · ' + j.error;
+    if (j.note && j.status !== 'downloading') line += ' · ' + j.note;
     const btn = j.status === 'queued' || j.status === 'downloading' ? `<button data-jc="${j.id}">Cancel</button>`
               : j.status === 'failed' || j.status === 'cancelled' ? `<button data-jr="${j.id}">${j.done ? 'Resume' : 'Retry'}</button>` : '';
     return `<div class="job ${j.status === 'exists' ? 'done' : j.status}"><div class="jt"><div title="${esc(j.title)}">${esc(j.title)}</div>${btn}</div>
@@ -1067,7 +1257,9 @@ function renderDl(d){
 async function pollDl(){
   clearTimeout(dlTimer);
   let active = false;
-  try { const d = await api('/api/downloads', {}); renderDl(d); active = d.jobs.some(j => j.status === 'queued' || j.status === 'downloading');
+  try { const d = await api('/api/downloads', {}); renderDl(d); active = d.jobs.some(j => ['queued', 'downloading', 'processing'].includes(j.status));
+    PREFS = d.prefs || PREFS; FF = !!d.ffmpeg; if (d.langs) LANGS = d.langs;
+    if (dlOpen) fillPrefs();
     if (dlOpen) for (const [id, key] of [['#fMovies', 'movies_folder'], ['#fTv', 'tv_folder']])
       if (document.activeElement !== $(id) && !$(id).dataset.edited) $(id).value = d[key];
     if (dlOpen) { $('#dlWorkers').value = String(d.workers); $('#dlOpen').classList.toggle('hidden', !d.can_open); }
@@ -1126,7 +1318,8 @@ function save(name, text, type){
 }
 function downloadM3u(name, entries){
   const clean = s => String(s || '').replace(/[\r\n"]/g, ' ');
-  const body = '#EXTM3U\n' + entries.map(x => `#EXTINF:-1${x.img ? ` tvg-logo="${clean(x.img)}"` : ''}${x.group ? ` group-title="${clean(x.group)}"` : ''},${clean(x.title)}\n${x.url}`).join('\n') + '\n';
+  const body = '#EXTM3U\n' + entries.map(x => `#EXTINF:-1${x.img ? ` tvg-logo="${clean(x.img)}"` : ''}${x.group ? ` group-title="${clean(x.group)}"` : ''},${clean(x.title)}\n`
+    + (x.opts || vlcOpts({})).map(o => `#EXTVLCOPT:${o}\n`).join('') + x.url).join('\n') + '\n';
   save(name + '.m3u', body, 'audio/x-mpegurl'); toast(`Saved ${entries.length} item${entries.length===1?'':'s'}`);
 }
 const catName = id => (S.cats.find(c => c.id === id) || {}).name || id;
@@ -1149,6 +1342,75 @@ $('#expCsv').onclick = () => {
     doLogin(() => connectXtream(saved.server, saved.user, saved.pass, true)); }
   else if (saved.mode === 'm3u') { setMode('m'); $('#m3u').value = saved.url; doLogin(() => connectM3u(saved.url, true)); }
 })();
+
+/* ---------- audio & subtitles ---------- */
+let PREFS = {audio_lang:'eng', sub_lang:'eng', keep_audio:false, srt:true}, FF = false, LANGS = [['eng', 'English']];
+const langOpts = (sel, withOff) => (withOff ? `<option value="off"${sel === 'off' ? ' selected' : ''}>Off</option>` : '')
+  + LANGS.map(([c, n]) => `<option value="${c}"${c === sel ? ' selected' : ''}>${esc(n)}</option>`).join('');
+function fillPrefs(){
+  if (document.activeElement !== $('#pAudio')) $('#pAudio').innerHTML = langOpts(PREFS.audio_lang, false);
+  if (document.activeElement !== $('#pSub')) $('#pSub').innerHTML = langOpts(PREFS.sub_lang, true);
+  $('#pKeep').checked = !!PREFS.keep_audio; $('#pSrt').checked = !!PREFS.srt;
+  $('#ffNote').classList.toggle('hidden', FF);
+}
+const savePrefs = async () => {
+  try { const d = await post('/api/settings', {prefs:{audio_lang:$('#pAudio').value, sub_lang:$('#pSub').value, keep_audio:$('#pKeep').checked, srt:$('#pSrt').checked}});
+        PREFS = d.prefs; toast('Audio & subtitle defaults saved'); } catch(e) { toast(e.message); }
+};
+['#pAudio', '#pSub', '#pKeep', '#pSrt'].forEach(id => $(id).onchange = savePrefs);
+const LANG2 = {eng:'en', spa:'es', fre:'fr', ger:'de', ita:'it', por:'pt', dut:'nl', pol:'pl', tur:'tr', ara:'ar', hin:'hi', rus:'ru', jpn:'ja', kor:'ko', chi:'zh', swe:'sv', nor:'no', dan:'da', fin:'fi', gre:'el', heb:'he', per:'fa', rum:'ro', hun:'hu', cze:'cs', ukr:'uk'};
+function vlcOpts(it){
+  const o = [];
+  if (Number.isInteger(it.audio_n)) o.push(`audio-track=${it.audio_n}`);
+  else o.push(`audio-language=${[PREFS.audio_lang, LANG2[PREFS.audio_lang]].filter(Boolean).join(',')},any`);
+  if (it.subs === 'none' || (it.subs == null && PREFS.sub_lang === 'off')) o.push('sub-track=-1', 'sub-language=none');
+  else if (Number.isInteger(it.subs_n)) o.push(`sub-track=${it.subs_n}`);
+  else o.push(`sub-language=${[PREFS.sub_lang, LANG2[PREFS.sub_lang]].filter(Boolean).join(',')}`);
+  return o;
+}
+const chLabel = c => ({1:'Mono', 2:'Stereo', 6:'5.1', 7:'6.1', 8:'7.1'})[c] || (c ? c + ' ch' : '');
+const aLabel = a => [a.lang_name || 'Unknown language', a.title, [String(a.codec).toUpperCase(), chLabel(a.channels)].filter(Boolean).join(' ')].filter(Boolean).join(' · ') + (a.default ? ' (default)' : '');
+const sLabel = x => [x.lang_name || 'Unknown language', x.title].filter(Boolean).join(' · ') + (x.forced ? ' (forced)' : '') + (x.text ? '' : ' · picture-based');
+function prefA(audio){ const same = audio.filter(a => a.lang === PREFS.audio_lang);
+  return (same.sort((a, b) => (b.default - a.default) || (b.channels - a.channels))[0]) || audio.find(a => a.default) || audio[0]; }
+function prefS(subs){ if (PREFS.sub_lang === 'off') return null;
+  return subs.filter(x => x.lang === PREFS.sub_lang).sort((a, b) => (a.forced - b.forced) || (b.text - a.text))[0] || null; }
+function trkClose(){ $('#trk').classList.add('hidden'); $('#trk').innerHTML = ''; }
+$('#trk').addEventListener('click', e => { if (e.target.id === 'trk' || e.target.closest('[data-tclose]')) trkClose(); });
+async function openTracks(k){
+  const it = (DLREG.get(k) || [])[0]; if (!it) return;
+  const o = $('#trk');
+  o.innerHTML = `<div class="modal"><button class="x" data-tclose aria-label="Close">✕</button><div class="tk"><h2>${esc(it.title)}</h2>
+    <p class="note">Checking which audio and subtitle tracks this file has…</p></div></div>`;
+  o.classList.remove('hidden');
+  let tr;
+  try { tr = await api('/api/tracks', {url:it.url}); }
+  catch(e) { o.querySelector('.tk').innerHTML = `<h2>${esc(it.title)}</h2><p class="note">${esc(e.message)}</p>
+      <p class="note">Downloads will still use your default languages from the Downloads panel where the file allows.</p>
+      <div class="actions"><button data-tclose>Close</button></div>`; return; }
+  const a0 = Number.isInteger(it.audio) ? tr.audio.find(a => a.index === it.audio) : prefA(tr.audio);
+  const s0 = it.subs === 'none' ? null : Number.isInteger(it.subs) ? tr.subs.find(x => x.index === it.subs) : prefS(tr.subs);
+  o.querySelector('.tk').innerHTML = `<h2>${esc(it.title)}</h2>
+    <label for="tA">Audio</label>
+    ${tr.audio.length ? `<select id="tA">${tr.audio.map(a => `<option value="${a.index}"${a0 && a.index === a0.index ? ' selected' : ''}>${esc(aLabel(a))}</option>`).join('')}</select>`
+                      : '<p class="note">No separate audio tracks found.</p>'}
+    <label for="tS">Subtitles</label>
+    <select id="tS"><option value="none">None</option>${tr.subs.map(x => `<option value="${x.index}"${s0 && x.index === s0.index ? ' selected' : ''}>${esc(sLabel(x))}</option>`).join('')}</select>
+    ${tr.subs.length ? '' : '<p class="note">This file has no subtitle tracks.</p>'}
+    <p class="note">${tr.audio.length < 2 && !tr.subs.length ? 'This file only has one audio track and no subtitles, so there\'s nothing to choose.'
+      : 'Your choice is used when you download this title and when you open it in VLC.' + (FF ? '' : ' (Downloads need FFmpeg to apply it.)')}
+      Playing in the browser always uses the file's default track.</p>
+    <div class="actions"><button class="pri" id="tDl">⬇ Download with these</button><button id="tVlc">Open in VLC</button><button data-tclose>Done</button></div>`;
+  const keep = () => {
+    const ai = o.querySelector('#tA') ? +o.querySelector('#tA').value : null, sv = o.querySelector('#tS').value;
+    const a = tr.audio.find(x => x.index === ai), sb = tr.subs.find(x => x.index === +sv);
+    it.audio = a ? a.index : null; it.audio_n = a ? a.n : null;
+    it.subs = sv === 'none' ? 'none' : (sb ? sb.index : null); it.subs_n = sb ? sb.n : null;
+  };
+  o.querySelectorAll('select').forEach(x => x.onchange = keep); keep();
+  o.querySelector('#tDl').onclick = () => { keep(); queueDownloads([it]); trkClose(); };
+  o.querySelector('#tVlc').onclick = () => { keep(); downloadM3u(it.title, [{title:it.title, url:it.url, opts:vlcOpts(it)}]); };
+}
 
 /* ---------- updates ---------- */
 let UPD = null;
