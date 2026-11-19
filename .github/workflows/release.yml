@@ -6,7 +6,7 @@ name: Release
 on:
   push:
     branches: [main]
-    paths: ["iptv_library.py", "docker-compose.yml"]
+    paths: ["iptv_library.py", "docker-compose.yml", ".github/workflows/release.yml"]
   workflow_dispatch:
 
 permissions:
