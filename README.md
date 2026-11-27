@@ -21,6 +21,21 @@ It runs in Docker on UGREEN, Synology, Unraid or any other Docker host, and you 
 
 > Use it only with an IPTV service you're subscribed to, and check your provider's terms about downloading.
 
+## Android app
+
+Download **`IPTV-Library-x.y.z.apk`** from the [latest release](https://github.com/Fudgeamin99/iptvarr/releases/latest) on your phone and open it
+(allow "Install unknown apps" for your browser or file manager when asked).
+
+The whole app runs on the phone, with no NAS needed: log in, browse, play, and download to **Download/IPTV Library** on the phone.
+- A notification keeps it running while downloads finish in the background. Tap **Quit** on it to stop the app.
+- **Open in player app** hands a title to VLC, MX Player or any video player you have.
+- The **Back** button closes dialogs. When nothing is open, it leaves the app running in the background.
+- Plex/Jellyfin Live TV and the FFmpeg audio/subtitle features are only in the NAS version.
+- New versions show an **Update** button that downloads the new APK. Installing it over the old one keeps your login and settings.
+
+The APK is built by GitHub Actions from `android/` (a WebView shell running the same `iptv_library.py` with embedded Python via
+[Chaquopy](https://chaquo.com/chaquopy/)) and tested on an Android emulator before it's attached to the release.
+
 ## Install with Docker Compose
 
 1. Make a folder for it on your NAS, e.g. `/volume1/docker/iptvarr`.

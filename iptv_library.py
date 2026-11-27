@@ -39,7 +39,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 REPO = os.environ.get("IPTV_REPO", "Fudgeamin99/iptvarr")   # GitHub repo the Update button checks
 UA = "Mozilla/5.0 (IPTV Library) VLC/3.0.20"
 # Many IPTV panels use self-signed / expired certificates.
@@ -2132,6 +2132,7 @@ $('#expCsv').onclick = () => {
 };
 
 /* ---------- auto login ---------- */
+if (window.AndroidApp) ['#rem', '#rem2'].forEach(id => { const l = $(id).parentNode; l.lastChild.textContent = ' Remember on this phone'; });
 (async () => {
   const saved = load('iptv'); if (!saved) return;
   if (saved.mode === 'xtream') { $('#server').value = saved.server; $('#user').value = saved.user; $('#pass').value = saved.pass;
