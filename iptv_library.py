@@ -132,7 +132,8 @@ APP_PASSWORD = os.environ.get("IPTV_APP_PASSWORD", "")
 # Folder picker limit: on Docker this is /downloads so the picker can't wander round the container.
 BROWSE_ROOT = Path(os.environ["IPTV_BROWSE_ROOT"]).resolve() if os.environ.get("IPTV_BROWSE_ROOT") else None
 JUNK_DIRS = ("@eaDir", "#recycle", "#snapshot", "@Recycle", "$RECYCLE.BIN", "System Volume Information", "lost+found")
-CAN_OPEN = sys.platform.startswith("win") or sys.platform == "darwin" or bool(shutil.which("xdg-open"))
+ANDROID = bool(os.environ.get("IPTV_ANDROID"))         # running inside the Android app
+CAN_OPEN = (not ANDROID) and sys.platform.startswith("win") or sys.platform == "darwin" or bool(shutil.which("xdg-open"))
 BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 ACTIVE = ("queued", "downloading", "processing")
@@ -618,7 +619,7 @@ class Downloader:
         keep = ("id", "title", "dest", "status", "done", "total", "speed", "error", "note")
         return {"folder": str(self.folder), "movies_folder": str(self.movies), "tv_folder": str(self.tv),
                 "workers": self.max, "can_open": CAN_OPEN, "prefs": self.prefs, "ffmpeg": bool(FFMPEG and FFPROBE),
-                "ff_install": FF_INSTALL, "ff_can_install": bool(ffmpeg_installer()),
+                "ff_install": FF_INSTALL, "ff_can_install": bool(ffmpeg_installer()) and not ANDROID, "android": ANDROID,
                 "langs": [[c, n] for c, n, _, _ in LANGS],
                 "jobs": [{k: j.get(k, "") for k in keep} for j in sorted(self.jobs.values(), key=lambda j: -j["id"])]}
 
@@ -785,6 +786,13 @@ def update_info(force=False):
         _RELEASE.update(t=time.time(), data=data)
     rel = _RELEASE["data"]
     latest = str(rel.get("tag_name", "")).lstrip("vV")
+    if ANDROID:                                         # phone app: updates come as a new APK
+        apk = next((a for a in rel.get("assets", []) if str(a.get("name", "")).lower().endswith(".apk")), None)
+        available = ver_tuple(latest) > ver_tuple(VERSION)
+        return {"current": VERSION, "latest": latest or VERSION, "available": available, "notes": rel.get("body") or "",
+                "page": rel.get("html_url") or f"https://github.com/{REPO}/releases", "can_apply": False, "android": True,
+                "apk": apk and apk.get("browser_download_url"),
+                "reason": "" if not available or apk else "The phone app for this version is still being built - try again in a few minutes."}
     asset = next((a for a in rel.get("assets", []) if a.get("name") == "iptv_library.py"), None)
     target = Path(__file__).resolve()
     writable = os.access(target, os.W_OK) and os.access(target.parent, os.W_OK)
@@ -1331,6 +1339,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send(400, {"error": str(e)})
 
 
+def main_android(port=8765):
+    """Entry point used by the Android app (it sets the IPTV_* folders before importing this file)."""
+    sys.argv = ["iptv_library", "--port", str(port), "--no-browser"]
+    main()
+
+
 def main():
     global DL
     ap = argparse.ArgumentParser(description="IPTV Library")
@@ -1523,7 +1537,19 @@ video::cue{background:rgba(0,0,0,.72);font-size:1.05em}
 .addr{display:flex;gap:8px;align-items:center}.addr code{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px 11px;font-size:13px;overflow:auto;white-space:nowrap}
 .setup .note{color:var(--mute);font-size:13px;margin:0}.setup .warn{color:var(--acc2);font-size:13px;margin:0}
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--acc);color:#1a1205;padding:9px 16px;border-radius:8px;font-weight:600;z-index:20}
-@media (max-width:760px){#app{grid-template-columns:1fr}aside{display:none}header{flex-wrap:wrap}.mbody{flex-direction:column;margin-top:-60px}.mbody h2{margin-top:0}}
+@media (max-width:760px){
+  #app{grid-template-columns:1fr;grid-template-rows:auto auto 1fr}
+  header{grid-column:1;flex-wrap:wrap;padding:10px 12px;gap:8px}header .brand{font-size:16px}
+  #q{max-width:none;flex:1 1 100%;order:10}#sort{order:11;flex:1 1 auto}.acct{display:none}
+  aside{grid-column:1;border-right:0;border-bottom:1px solid var(--line);padding:8px 10px;overflow-x:auto;overflow-y:hidden;white-space:nowrap}
+  aside #cq{display:none}#cats{display:flex;gap:6px}.cat{flex:none;background:var(--panel2);border-radius:16px;padding:7px 12px}
+  main{padding:12px}.grid{grid-template-columns:repeat(auto-fill,minmax(105px,1fr));gap:10px}.grid.rows{grid-template-columns:1fr}
+  .bar{flex-wrap:wrap}.mbody{flex-direction:column;margin-top:-60px;padding:0 16px 20px}.mbody h2{margin-top:0}
+  .mbody .pp{width:120px}.hero{height:170px}
+  .ov{padding:0}.modal{max-height:100vh;height:100%;border-radius:0;border:0}.player{width:100%}
+  .ep{flex-wrap:wrap}.ep .info{flex:1 1 60%}.seasons{padding:0 16px 20px}
+  .pbar select{max-width:100%;flex:1 1 40%}
+}
 </style></head><body>
 
 <section id="login">
@@ -1627,7 +1653,7 @@ function normServer(s){ s = s.trim(); if(!/^https?:\/\//i.test(s)) s = 'http://'
 const enc = encodeURIComponent;
 const movieUrl = (id, ext) => `${S.server}/movie/${enc(S.user)}/${enc(S.pass)}/${id}.${ext||'mp4'}`;
 const epUrl = (id, ext) => `${S.server}/series/${enc(S.user)}/${enc(S.pass)}/${id}.${ext||'mp4'}`;
-function toast(t){ const d=document.createElement('div'); d.className='toast'; d.textContent=t; document.body.appendChild(d); setTimeout(()=>d.remove(),1800); }
+function toast(t){ document.querySelectorAll('.toast').forEach(x => x.remove()); const d=document.createElement('div'); d.className='toast'; d.textContent=t; document.body.appendChild(d); setTimeout(()=>d.remove(),1800); }
 function store(k,v){ try{ v===null ? localStorage.removeItem(k) : localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
 function load(k){ try{ return JSON.parse(localStorage.getItem(k)); }catch(e){ return null; } }
 
@@ -1820,7 +1846,7 @@ function epDl(SH, season, e){
 }
 const actBtns = (url, title, dlk) => `<button class="pri" data-play="${esc(url)}" data-title="${esc(title)}" data-dlk="${dlk || ''}">▶ Play</button>
   ${dlk ? `<button data-dl="${dlk}">⬇ Download</button>` : ''}
-  <button data-vlc="${esc(url)}" data-title="${esc(title)}" data-dlk="${dlk || ''}">Open in VLC (.m3u)</button><button data-copy="${esc(url)}">Copy link</button>`;
+  <button data-vlc="${esc(url)}" data-title="${esc(title)}" data-dlk="${dlk || ''}">${window.AndroidApp ? 'Open in player app' : 'Open in VLC (.m3u)'}</button><button data-copy="${esc(url)}">Copy link</button>`;
 function header(o){
   return `<div class="hero" style="${o.backdrop ? `background-image:url('${esc(o.backdrop)}')` : ''}"></div>
   <div class="mbody"><div class="pp">${o.img ? `<img src="${esc(o.img)}" onerror="this.remove()">` : ''}</div>
@@ -1892,8 +1918,10 @@ document.addEventListener('click', e => {
   const b = e.target.closest('button'); if (!b) return;
   if (b.dataset.play) play(b.dataset.play, b.dataset.title, b.dataset.dlk);
   else if (b.dataset.dl) startDownload(DLREG.get(b.dataset.dl));
+  else if (b.dataset.vlc && window.AndroidApp) AndroidApp.playExternal(b.dataset.vlc, b.dataset.title || '');
   else if (b.dataset.vlc) { const it = b.dataset.dlk && (DLREG.get(b.dataset.dlk) || [])[0];
     downloadM3u(b.dataset.title, [{title:b.dataset.title, url:b.dataset.vlc, opts: it ? vlcOpts(it) : null}]); }
+  else if (b.dataset.copy && window.AndroidApp) { AndroidApp.copy(b.dataset.copy); toast('Link copied'); }
   else if (b.dataset.copy) navigator.clipboard.writeText(b.dataset.copy).then(() => toast('Link copied'), () => prompt('Copy this link:', b.dataset.copy));
 });
 /* ---------- player: pick audio & subtitles while watching (needs FFmpeg on the server) ---------- */
@@ -2080,6 +2108,7 @@ $('#dlList').onclick = e => { const b = e.target.closest('button'); if (!b) retu
   if (b.dataset.jr) post('/api/downloads/retry', {id:+b.dataset.jr}).then(pollDl); };
 pollDl();
 function save(name, text, type){
+  if (window.AndroidApp) { const where = AndroidApp.saveText(name.replace(/[\\/:*?"<>|]+/g, '_'), text); toast(where ? 'Saved to ' + where : 'Couldn\'t save the file'); return; }
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], {type}));
   a.download = name.replace(/[\\/:*?"<>|]+/g, '_'); a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
@@ -2116,6 +2145,7 @@ const langOpts = (sel, withOff) => (withOff ? `<option value="off"${sel === 'off
   + LANGS.map(([c, n]) => `<option value="${c}"${c === sel ? ' selected' : ''}>${esc(n)}</option>`).join('');
 let FFI = {state:'idle'}, FF_CAN = false;
 function ffStateText(){
+  if (window.AndroidApp) return 'Audio & subtitle choices need FFmpeg, which isn\'t in the phone app. Downloads keep every track as it is.';
   return FFI.state === 'installing' ? 'Installing… this takes about a minute.' : FFI.state === 'failed' ? 'Install failed: ' + (FFI.error || 'unknown error')
     : FF_CAN ? '' : 'Install FFmpeg on this computer, or use the latest docker-compose.yml from GitHub.';
 }
@@ -2310,8 +2340,12 @@ async function showUpdate(){
     ${u.reason ? `<p class="warn">${esc(u.reason)}</p>` : ''}`;
   m.innerHTML = `<button class="x" data-close>✕</button><div class="upd"><h2>Updates</h2>${body}
     <div class="actions">${u.can_apply ? '<button class="pri" id="updGo">Update now</button>' : ''}
-    <button id="updPage">View on GitHub</button></div></div>`;
-  m.querySelector('#updPage').onclick = () => window.open(u.page || 'https://github.com', '_blank', 'noopener');
+    ${u.android && u.available && u.apk ? '<button class="pri" id="updApk">Download the new app</button>' : ''}
+    <button id="updPage">View on GitHub</button></div>
+    ${u.android && u.available && u.apk ? '<p class="note">After it downloads, open it to install over this version. Your login, downloads and settings are kept.</p>' : ''}</div>`;
+  const ext = url => window.AndroidApp ? AndroidApp.openUrl(url) : window.open(url, '_blank', 'noopener');
+  m.querySelector('#updPage').onclick = () => ext(u.page || 'https://github.com');
+  const apkB = m.querySelector('#updApk'); if (apkB) apkB.onclick = () => ext(u.apk);
   const go = m.querySelector('#updGo');
   if (go) go.onclick = async () => {
     go.disabled = true; go.textContent = 'Downloading update…';
@@ -2327,6 +2361,15 @@ async function showUpdate(){
     setTimeout(wait, 2500);
   };
 }
+/* Android back button: close whatever is open; returns false when there's nothing left to close */
+window.iptvBack = () => {
+  const t = $('#trk'); if (t && !t.classList.contains('hidden')) { trkClose(); return true; }
+  if (document.fullscreenElement) { document.exitFullscreen(); return true; }
+  if (!$('#ov').classList.contains('hidden')) { closeOv(); return true; }
+  if (!$('#dl').classList.contains('hidden')) { $('#dlClose').click(); return true; }
+  return false;
+};
+if (window.AndroidApp) document.querySelectorAll('[data-tab="live"]').forEach(b => b.remove());   // Plex/Jellyfin tuner is a NAS feature
 $('#verBtn').onclick = showUpdate; $('#updBtn').onclick = showUpdate;
 checkUpdate(false); setInterval(() => checkUpdate(false), 6 * 3600 * 1000);
 </script></body></html>

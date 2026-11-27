@@ -1,0 +1,5 @@
+app/src/main/python/
+.gradle/
+build/
+app/build/
+local.properties
