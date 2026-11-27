@@ -57,3 +57,4 @@ tasks.register("copyAppSource", Copy) {
     into "src/main/python"
 }
 preBuild.dependsOn "copyAppSource"
+tasks.matching { it.name.contains("Python") }.configureEach { dependsOn "copyAppSource" }
