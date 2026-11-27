@@ -1,0 +1,59 @@
+plugins {
+    id "com.android.application"
+    id "com.chaquo.python"
+}
+
+// The app's version comes from iptv_library.py, so the APK always matches the release
+def appSource = new File(rootDir, "../iptv_library.py")
+def appVersion = (appSource.text =~ /(?m)^VERSION = "([0-9.]+)"/)[0][1]
+def parts = appVersion.tokenize(".").collect { it as int } + [0, 0]
+
+android {
+    namespace "com.fudgeamin.iptvlibrary"
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.fudgeamin.iptvlibrary"
+        minSdk 24
+        targetSdk 34
+        versionCode parts[0] * 10000 + parts[1] * 100 + parts[2]
+        versionName appVersion
+        ndk { abiFilters "arm64-v8a", "armeabi-v7a", "x86_64" }
+    }
+
+    // One fixed key so each new APK installs over the old one (keeps your login and settings)
+    signingConfigs {
+        app {
+            storeFile file("../iptvlibrary.keystore")
+            storePassword "iptvlibrary"
+            keyAlias "iptvlibrary"
+            keyPassword "iptvlibrary"
+        }
+    }
+    buildTypes {
+        release { minifyEnabled false; signingConfig signingConfigs.app }
+        debug { signingConfig signingConfigs.app }
+    }
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+chaquopy {
+    defaultConfig {
+        version "3.11"
+        pyc { src false }        // ship plain .py (no build-machine Python needed)
+    }
+}
+
+// Bundle the same iptv_library.py that the NAS runs
+tasks.register("copyAppSource", Copy) {
+    from appSource
+    into "src/main/python"
+}
+preBuild.dependsOn "copyAppSource"

@@ -5,5 +5,5 @@ dist/
 *.spec
 *.part
 # local Docker data
-app/
-config/
+/app/
+/config/
