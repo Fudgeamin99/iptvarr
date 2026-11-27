@@ -82,3 +82,41 @@ jobs:
         with:
           tag_name: v${{ needs.release.outputs.version }}
           files: IPTV-Library-*.apk
+
+  # Smoke test: install the APK on an Android emulator and check the app starts and answers
+  apk-test:
+    needs: apk
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: IPTV-Library-apk
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+
+      - name: Run on an emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 33
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: |
+            adb install -r -g IPTV-Library-*.apk
+            adb shell am start -n com.fudgeamin.iptvlibrary/.MainActivity
+            sleep 25
+            adb forward tcp:8765 tcp:8765
+            echo "== page:"; curl -sf -m 10 http://127.0.0.1:8765/ | grep -o "<title>[^<]*</title>" || echo "PAGE FAILED"
+            echo "== version:"; curl -sf -m 10 http://127.0.0.1:8765/api/version || echo "VERSION FAILED"
+            echo; echo "== downloads:"; curl -sf -m 10 http://127.0.0.1:8765/api/downloads | head -c 400 || echo "DOWNLOADS FAILED"
+            echo; echo "== update check:"; curl -sf -m 30 http://127.0.0.1:8765/api/update/check | head -c 400 || echo "UPDATE FAILED"
+            echo; echo "== folders:"; curl -sf -m 10 "http://127.0.0.1:8765/api/folders" | head -c 300 || echo "FOLDERS FAILED"
+            echo; echo "== notification/service:"; adb shell dumpsys activity services com.fudgeamin.iptvlibrary | grep -E "ServiceRecord|isForeground" | head -4 || true
+            echo "== app log:"; adb logcat -d -s IPTVLibrary:* python.stdout:* python.stderr:* AndroidRuntime:E | tail -40
+            curl -sf -m 10 http://127.0.0.1:8765/api/version > /dev/null
+
