@@ -117,6 +117,24 @@ jobs:
             echo; echo "== update check:"; curl -sf -m 30 http://127.0.0.1:8765/api/update/check | head -c 400 || echo "UPDATE FAILED"
             echo; echo "== folders:"; curl -sf -m 10 "http://127.0.0.1:8765/api/folders" | head -c 300 || echo "FOLDERS FAILED"
             echo; echo "== notification/service:"; adb shell dumpsys activity services com.fudgeamin.iptvlibrary | grep -E "ServiceRecord|isForeground" | head -4 || true
+            adb exec-out screencap -p > shot-1-start.png
+            echo "== download test:"
+            curl -sf -XPOST -H 'Content-Type: application/json' http://127.0.0.1:8765/api/downloads/add -d '{"items":[{"url":"https://raw.githubusercontent.com/Fudgeamin99/iptvarr/main/assets/icon.png","title":"CI test","kind":"movie","path":["CI test","ci-test.png"]}]}' || echo "ADD FAILED"
+            sleep 10
+            curl -sf -m 10 http://127.0.0.1:8765/api/downloads | grep -o '"jobs": \[.*' | head -c 500; echo
+            adb shell 'ls -l "/storage/emulated/0/Download/IPTV Library/Movies/CI test/"' || echo "FILE NOT FOUND"
+            adb shell input keyevent KEYCODE_BACK; sleep 2
+            echo "== still running after Back: $(curl -sf -m 5 http://127.0.0.1:8765/api/version || echo NO)"
+            adb shell am start -n com.fudgeamin.iptvlibrary/.MainActivity; sleep 4
+            adb shell wm size 1080x2400; adb exec-out screencap -p > shot-2-again.png
             echo "== app log:"; adb logcat -d -s IPTVLibrary:* python.stdout:* python.stderr:* AndroidRuntime:E | tail -40
             curl -sf -m 10 http://127.0.0.1:8765/api/version > /dev/null
+
+      - name: Save screenshots to the ci-shots branch
+        if: always()
+        run: |
+          ls shot-*.png || exit 0
+          mkdir shots && cp shot-*.png shots/ && cd shots
+          git init -q -b ci-shots && git add . && git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -q -m "APK screenshots ${{ github.sha }}"
+          git push -q -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" ci-shots
 
